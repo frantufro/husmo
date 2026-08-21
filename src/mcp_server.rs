@@ -23,7 +23,7 @@ use crate::document::Document;
 use crate::extract::OutgoingLink;
 use crate::git_sync::{self, SyncError};
 use crate::save::{self, SaveError, SaveInput};
-use crate::store::{self, IdentifierError, ResolveError};
+use crate::store::{self, IdentifierError, ResolveError, StoreError};
 
 /// The husmo MCP server: holds the data repo path every tool operates
 /// against. Constructed once per session and served over stdio (see
@@ -96,12 +96,18 @@ pub struct DocumentDto {
     pub author: Option<String>,
     /// See [`Document::content`].
     pub content: String,
-    /// See [`Document::related`].
-    pub related: Vec<String>,
+    /// The Document's Related documents, by reference rather than inlined,
+    /// per `docs/ARCHITECTURE.md` ("Related").
+    pub related: Vec<RelatedRefDto>,
 }
 
-impl From<Document> for DocumentDto {
-    fn from(document: Document) -> Self {
+impl DocumentDto {
+    /// Builds the wire DTO for `document`, pairing it with `related` —
+    /// its Related ids already resolved to `(id, title)` references (see
+    /// [`resolve_related_refs`]). Kept as a plain function rather than a
+    /// `From<Document>` impl since resolving those references needs a
+    /// store lookup a bare `Document` can't provide.
+    fn from_document(document: Document, related: Vec<RelatedRefDto>) -> Self {
         DocumentDto {
             id: document.id,
             slug: document.slug,
@@ -112,9 +118,42 @@ impl From<Document> for DocumentDto {
             summary: document.summary,
             author: document.author,
             content: document.content,
-            related: document.related,
+            related,
         }
     }
+}
+
+/// A Related Document referenced by id and title rather than inlined, per
+/// `docs/ARCHITECTURE.md` ("Related": "`get` and every search result
+/// always list a Document's Related documents by reference (id/title)").
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RelatedRefDto {
+    /// The related Document's stable internal id.
+    pub id: String,
+    /// The related Document's title.
+    pub title: String,
+}
+
+/// Resolves a Document's `related` ids to `(id, title)` references, per
+/// `docs/ARCHITECTURE.md` ("Related"), by looking each id up among the
+/// Documents in `dir`. A related id with no matching Document on disk
+/// (e.g. the other side of the edge was deleted independently) is
+/// silently omitted rather than surfaced as an error.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] if `dir` can't be read.
+fn resolve_related_refs(dir: &std::path::Path, related_ids: &[String]) -> Result<Vec<RelatedRefDto>, StoreError> {
+    let documents = store::load_all(dir)?;
+    Ok(related_ids
+        .iter()
+        .filter_map(|id| {
+            documents.iter().find(|doc| doc.id == *id).map(|doc| RelatedRefDto {
+                id: doc.id.clone(),
+                title: doc.title.clone(),
+            })
+        })
+        .collect())
 }
 
 /// Parameters for the `get` tool. Exactly one of `id`/`slug`/`url` is
@@ -207,8 +246,10 @@ impl HusmoServer {
         .map_err(|error| ErrorData::internal_error(format!("save task panicked: {error}"), None))?
         .map_err(|error| sync_error_to_mcp_error(&error))?;
 
+        let related = resolve_related_refs(&self.data_repo_path, &output.document.related)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
         Ok(Json(SaveResult {
-            document: output.document.into(),
+            document: DocumentDto::from_document(output.document, related),
             outgoing_links: output.outgoing_links.into_iter().map(Into::into).collect(),
         }))
     }
@@ -221,15 +262,17 @@ impl HusmoServer {
     /// than on the blocking thread pool.
     #[tool(
         description = "Look up a Document by exactly one of `id`, `slug`, or `url`. Returns \
-            the Document, including its Related list by reference (ids only; use `search-*` \
-            with expansion to pull in their content)."
+            the Document, including its Related list by reference (id and title; use \
+            `search-*` with expansion to pull in their content)."
     )]
     async fn get(&self, Parameters(params): Parameters<GetParams>) -> Result<Json<DocumentDto>, ErrorData> {
         let identifier = store::identifier(params.id, params.slug, params.url)
             .map_err(identifier_error_to_mcp_error)?;
         let document = store::resolve(&self.data_repo_path, &identifier)
             .map_err(|error| resolve_error_to_mcp_error(&error))?;
-        Ok(Json(document.into()))
+        let related = resolve_related_refs(&self.data_repo_path, &document.related)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
+        Ok(Json(DocumentDto::from_document(document, related)))
     }
 }
 
@@ -252,6 +295,12 @@ fn sync_error_to_mcp_error(error: &SyncError<SaveError>) -> ErrorData {
 /// parameters to the MCP error reported back to the client.
 fn identifier_error_to_mcp_error(error: IdentifierError) -> ErrorData {
     ErrorData::invalid_params(error.to_string(), None)
+}
+
+/// Maps a failure from [`resolve_related_refs`] reading the data repo to
+/// the MCP error reported back to the client.
+fn store_error_to_mcp_error(error: &StoreError) -> ErrorData {
+    ErrorData::internal_error(error.to_string(), None)
 }
 
 /// Maps a failure from resolving the `get` tool's identifier to a Document
@@ -667,7 +716,10 @@ mod tests {
             .structured_content
             .expect("get tool should return structured content");
 
-        assert_eq!(structured["related"], serde_json::json!([doc_b.id]));
+        assert_eq!(
+            structured["related"],
+            serde_json::json!([{ "id": doc_b.id, "title": "B" }])
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
