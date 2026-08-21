@@ -14,7 +14,10 @@ not an incidental implementation choice — see
 Concretely:
 
 - **No external embeddings API.** Embeddings are generated locally,
-  in-process, via a Rust-native model.
+  in-process, via `candle` running a small pre-trained sentence-embedding
+  model (`all-MiniLM-L6-v2`). Its weights are fetched once, on first use,
+  and cached locally after that — no network call happens on any
+  individual save or search.
 - **No external vector database.** The searchable index is assembled
   in-process from committed sidecar files, not stored in a separate service.
 - **No headless browser or JS rendering** for fetched pages — plain HTTP

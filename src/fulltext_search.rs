@@ -4,11 +4,12 @@
 //! This is a literal, case-insensitive substring search over a Document's
 //! title and content — deliberately distinct from
 //! [`crate::semantic_search`], which scores chunks by cosine similarity
-//! between whole-token bag-of-words vectors (see [`crate::embed`]). A query
-//! that's a substring of a larger token (e.g. `"cern"` inside
-//! `"concerned"`) or that shares no vocabulary with a chunk it nonetheless
-//! appears in verbatim is exactly the case semantic search can plausibly
-//! miss and this module still finds.
+//! between sentence-embedding vectors (see [`crate::embed`]) and has no
+//! notion of exact substrings at all. A query that's a substring of a
+//! larger word (e.g. `"cern"` inside `"concerned"`) or that otherwise
+//! appears verbatim in a chunk without matching its overall meaning is
+//! exactly the case semantic search can plausibly miss and this module
+//! still finds.
 
 use crate::document::Document;
 
@@ -62,10 +63,9 @@ mod tests {
 
     #[test]
     fn fulltext_search_finds_an_exact_substring_inside_a_larger_word() {
-        // "cern" only ever appears here as part of "concerned". A
-        // whole-token, bag-of-words semantic search (see
-        // `crate::embed::tokenize`) treats "concerned" as one atomic token
-        // and would need the literal token "cern" to appear on its own to
+        // "cern" only ever appears here as part of "concerned". Semantic
+        // search has no notion of exact substrings — it would need "cern"
+        // to appear on its own, or a chunk with related meaning, to
         // register any similarity at all, so it can plausibly miss this.
         // Full-text/keyword search matches it directly as a literal
         // substring.
