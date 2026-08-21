@@ -20,10 +20,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
+use crate::embed::EmbedError;
+use crate::embeddings::EmbeddingsError;
 use crate::extract::OutgoingLink;
+use crate::fulltext_search::{self, FullTextSearchHit};
 use crate::git_sync::{self, SyncError};
 use crate::save::{self, SaveError, SaveInput};
+use crate::semantic_search::{self, SemanticSearchHit};
 use crate::store::{self, IdentifierError, ResolveError, StoreError};
+use crate::tag_search;
+use crate::vector_index;
 
 /// The husmo MCP server: holds the data repo path every tool operates
 /// against. Constructed once per session and served over stdio (see
@@ -206,6 +212,96 @@ pub struct SaveResult {
     pub outgoing_links: Vec<OutgoingLinkDto>,
 }
 
+/// The default number of hits `search-semantic` returns when the caller
+/// doesn't specify `top_k`.
+fn default_top_k() -> usize {
+    10
+}
+
+/// Parameters for the `search-semantic` tool. See
+/// `docs/ARCHITECTURE.md` ("Retrieval", "MCP server"): "`search-semantic`
+/// — with an opt-in flag to expand into Related documents' content."
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchSemanticParams {
+    /// The natural-language query to search for.
+    pub query: String,
+    /// Maximum number of Documents to return, most similar first. Defaults
+    /// to 10.
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    /// When `true`, each hit's `expanded_related` is populated with the
+    /// full content of every Document it's Related to. Defaults to
+    /// `false`, in which case `expanded_related` is always empty (the
+    /// Related ids are still visible on `document.related`).
+    #[serde(default)]
+    pub expand_related: bool,
+}
+
+/// Parameters for the `search-tag` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchTagParams {
+    /// The exact tag to filter Documents by.
+    pub tag: String,
+}
+
+/// Parameters for the `search-fulltext` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchFulltextParams {
+    /// The literal, case-insensitive substring to search for across every
+    /// Document's title and content.
+    pub query: String,
+}
+
+/// One Document that matched a `search-semantic` query. Mirrors
+/// [`SemanticSearchHit`], with `document` and `expanded_related` rendered
+/// as wire DTOs.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SemanticSearchHitDto {
+    /// The matching Document.
+    pub document: DocumentDto,
+    /// This Document's best-matching chunk's cosine similarity to the
+    /// query, in `[-1, 1]`.
+    pub score: f32,
+    /// The text of the chunk that produced `score`.
+    pub matched_chunk: String,
+    /// The full content of every Document this hit is Related to.
+    /// Populated only when the call's `expand_related` was `true`.
+    pub expanded_related: Vec<DocumentDto>,
+}
+
+/// The `search-semantic` tool's result.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SearchSemanticResult {
+    /// The matching Documents, most similar first.
+    pub hits: Vec<SemanticSearchHitDto>,
+}
+
+/// The `search-tag` tool's result.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SearchTagResult {
+    /// Every Document tagged with the requested tag, in their original
+    /// relative order.
+    pub documents: Vec<DocumentDto>,
+}
+
+/// One Document that matched a `search-fulltext` query. Mirrors
+/// [`FullTextSearchHit`], with `document` rendered as a wire DTO.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct FulltextSearchHitDto {
+    /// The matching Document.
+    pub document: DocumentDto,
+    /// How many times the query occurs (case-insensitively) across the
+    /// Document's title and content combined.
+    pub match_count: usize,
+}
+
+/// The `search-fulltext` tool's result.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SearchFulltextResult {
+    /// The matching Documents, most occurrences first.
+    pub hits: Vec<FulltextSearchHitDto>,
+}
+
 #[tool_router]
 impl HusmoServer {
     /// Saves a URL, pasted text, or local file as a Document: dispatches
@@ -274,6 +370,134 @@ impl HusmoServer {
             .map_err(|error| store_error_to_mcp_error(&error))?;
         Ok(Json(DocumentDto::from_document(document, related)))
     }
+
+    /// Semantic search over Document content, RAG-style, per
+    /// `docs/ARCHITECTURE.md` ("Retrieval"): builds the in-memory vector
+    /// index from the data repo's committed chunk-embedding sidecar files
+    /// (`crate::vector_index::build_from_dir`) and scores every Document by
+    /// its best-matching chunk (`crate::semantic_search::semantic_search`).
+    /// A pure local read, so it runs directly rather than on the blocking
+    /// thread pool.
+    #[tool(
+        name = "search-semantic",
+        description = "Semantic search over Document content, RAG-style: finds the \
+            Documents whose meaning best matches `query`, ranked by cosine similarity \
+            over chunk embeddings, most similar first. Distinct from `search-fulltext`, \
+            which matches exact substrings, and `search-tag`, which filters by exact tag \
+            membership. Each hit's Related documents are always visible by reference on \
+            `document.related`; set `expand_related` to additionally pull their full \
+            content into `expanded_related`."
+    )]
+    async fn search_semantic(
+        &self,
+        Parameters(params): Parameters<SearchSemanticParams>,
+    ) -> Result<Json<SearchSemanticResult>, ErrorData> {
+        let documents = store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let index = vector_index::build_from_dir(&self.data_repo_path)
+            .map_err(|error| embeddings_error_to_mcp_error(&error))?;
+        let hits = semantic_search::semantic_search(
+            &index,
+            &documents,
+            &params.query,
+            params.top_k,
+            params.expand_related,
+        )
+        .map_err(|error| embed_error_to_mcp_error(&error))?;
+
+        let hits = hits
+            .into_iter()
+            .map(|hit| self.semantic_hit_to_dto(hit))
+            .collect::<Result<Vec<_>, ErrorData>>()?;
+        Ok(Json(SearchSemanticResult { hits }))
+    }
+
+    /// Tag-filter search, per `docs/ARCHITECTURE.md` ("Retrieval",
+    /// `search-tag`): filters every Document in the data repo by exact
+    /// `tags` membership (`crate::tag_search::tag_search`). A pure local
+    /// read, so it runs directly rather than on the blocking thread pool.
+    #[tool(
+        name = "search-tag",
+        description = "Filter Documents by exact tag membership: returns every Document \
+            tagged with `tag`, in their original relative order. Distinct from \
+            `search-semantic` and `search-fulltext`, neither of which look at tags at all."
+    )]
+    async fn search_tag(
+        &self,
+        Parameters(params): Parameters<SearchTagParams>,
+    ) -> Result<Json<SearchTagResult>, ErrorData> {
+        let documents = store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let hits = tag_search::tag_search(&documents, &params.tag);
+
+        let documents = hits
+            .into_iter()
+            .map(|document| self.document_to_dto(document))
+            .collect::<Result<Vec<_>, ErrorData>>()?;
+        Ok(Json(SearchTagResult { documents }))
+    }
+
+    /// Full-text/keyword search, per `docs/ARCHITECTURE.md` ("Retrieval",
+    /// `search-fulltext`): literal, case-insensitive substring matches
+    /// against every Document's title and content
+    /// (`crate::fulltext_search::fulltext_search`) — exact matches
+    /// semantic search can miss. A pure local read, so it runs directly
+    /// rather than on the blocking thread pool.
+    #[tool(
+        name = "search-fulltext",
+        description = "Full-text/keyword search: finds every Document whose title or \
+            content contains `query` as a literal, case-insensitive substring, most \
+            occurrences first. Distinct from `search-semantic`, which scores chunks by \
+            meaning and can miss an exact substring match; use this when the caller \
+            knows the precise text to look for."
+    )]
+    async fn search_fulltext(
+        &self,
+        Parameters(params): Parameters<SearchFulltextParams>,
+    ) -> Result<Json<SearchFulltextResult>, ErrorData> {
+        let documents = store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let hits = fulltext_search::fulltext_search(&documents, &params.query);
+
+        let hits = hits
+            .into_iter()
+            .map(|hit| self.fulltext_hit_to_dto(hit))
+            .collect::<Result<Vec<_>, ErrorData>>()?;
+        Ok(Json(SearchFulltextResult { hits }))
+    }
+}
+
+impl HusmoServer {
+    /// Converts `document` to its wire DTO, resolving its `related` ids to
+    /// `(id, title)` references against the data repo (see
+    /// [`resolve_related_refs`]).
+    fn document_to_dto(&self, document: Document) -> Result<DocumentDto, ErrorData> {
+        let related = resolve_related_refs(&self.data_repo_path, &document.related)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
+        Ok(DocumentDto::from_document(document, related))
+    }
+
+    /// Converts a [`SemanticSearchHit`] to its wire DTO, rendering both the
+    /// hit's own Document and every Document in `expanded_related` as
+    /// DTOs (each with its own Related list resolved in turn).
+    fn semantic_hit_to_dto(&self, hit: SemanticSearchHit) -> Result<SemanticSearchHitDto, ErrorData> {
+        let expanded_related = hit
+            .expanded_related
+            .into_iter()
+            .map(|document| self.document_to_dto(document))
+            .collect::<Result<Vec<_>, ErrorData>>()?;
+        Ok(SemanticSearchHitDto {
+            document: self.document_to_dto(hit.document)?,
+            score: hit.score,
+            matched_chunk: hit.matched_chunk,
+            expanded_related,
+        })
+    }
+
+    /// Converts a [`FullTextSearchHit`] to its wire DTO.
+    fn fulltext_hit_to_dto(&self, hit: FullTextSearchHit) -> Result<FulltextSearchHitDto, ErrorData> {
+        Ok(FulltextSearchHitDto {
+            document: self.document_to_dto(hit.document)?,
+            match_count: hit.match_count,
+        })
+    }
 }
 
 /// The git commit message for a `save` call, describing what was saved.
@@ -310,6 +534,19 @@ fn resolve_error_to_mcp_error(error: &ResolveError) -> ErrorData {
         ResolveError::NotFound(_) => ErrorData::resource_not_found(error.to_string(), None),
         ResolveError::Store(_) => ErrorData::internal_error(error.to_string(), None),
     }
+}
+
+/// Maps a failure from embedding a `search-semantic` query to the MCP
+/// error reported back to the client.
+fn embed_error_to_mcp_error(error: &EmbedError) -> ErrorData {
+    ErrorData::internal_error(error.to_string(), None)
+}
+
+/// Maps a failure from loading the chunk-embedding sidecar files backing
+/// `search-semantic`'s vector index to the MCP error reported back to the
+/// client.
+fn embeddings_error_to_mcp_error(error: &EmbeddingsError) -> ErrorData {
+    ErrorData::internal_error(error.to_string(), None)
 }
 
 #[tool_handler(
@@ -766,5 +1003,217 @@ mod tests {
             result.is_err(),
             "calling get with an identifier matching no Document should fail, got {result:?}"
         );
+    }
+
+    /// Serves a fresh `HusmoServer` rooted at `data_repo_path` and calls its
+    /// tool named `tool_name` with `arguments`, over a real (in-memory) MCP
+    /// client/server connection. A generalized version of [`call_save`]/
+    /// [`call_get`] for the `search-*` tools, none of which need a
+    /// git-backed data repo with a remote to push to.
+    async fn call_tool(
+        data_repo_path: PathBuf,
+        tool_name: &'static str,
+        arguments: serde_json::Value,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ServiceError> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+
+        let server = HusmoServer::new(data_repo_path);
+        let server_handle = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .expect("server should start")
+                .waiting()
+                .await
+                .expect("server should shut down cleanly");
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("client should connect");
+
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new(tool_name).with_arguments(
+                    arguments
+                        .as_object()
+                        .expect("arguments should be a JSON object")
+                        .clone(),
+                ),
+            )
+            .await;
+
+        client.cancel().await.expect("client should shut down cleanly");
+        server_handle.await.expect("server task should not panic");
+
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_tag_tool_finds_documents_with_the_given_tag() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let mut rust_doc = crate::document::Document::new("Rust Notes", "Some Rust content.");
+        rust_doc.tags = vec!["rust".to_string()];
+        let cooking_doc = crate::document::Document::new("Cooking Notes", "Some cooking content.");
+        crate::store::write(dir.path(), &rust_doc).expect("write should succeed");
+        crate::store::write(dir.path(), &cooking_doc).expect("write should succeed");
+
+        let structured = call_tool(
+            dir.path().to_path_buf(),
+            "search-tag",
+            serde_json::json!({ "tag": "rust" }),
+        )
+        .await
+        .expect("search-tag tool call should succeed")
+        .structured_content
+        .expect("search-tag tool should return structured content");
+
+        assert_eq!(structured["documents"].as_array().expect("documents should be an array").len(), 1);
+        assert_eq!(structured["documents"][0]["id"], rust_doc.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_fulltext_tool_finds_an_exact_substring_match() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let matching =
+            crate::document::Document::new("Report", "Several reviewers were concerned about the plan.");
+        let unrelated = crate::document::Document::new("Unrelated", "Bake bread for forty minutes.");
+        crate::store::write(dir.path(), &matching).expect("write should succeed");
+        crate::store::write(dir.path(), &unrelated).expect("write should succeed");
+
+        let structured = call_tool(
+            dir.path().to_path_buf(),
+            "search-fulltext",
+            serde_json::json!({ "query": "cern" }),
+        )
+        .await
+        .expect("search-fulltext tool call should succeed")
+        .structured_content
+        .expect("search-fulltext tool should return structured content");
+
+        let hits = structured["hits"].as_array().expect("hits should be an array");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["document"]["id"], matching.id);
+        assert_eq!(hits[0]["match_count"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_semantic_tool_finds_documents_by_meaning() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let rust_doc = crate::document::Document::new(
+            "Rust",
+            "Rust is a systems programming language with strong static typing.",
+        );
+        let baking_doc =
+            crate::document::Document::new("Bread", "Bake the sourdough loaf for forty minutes.");
+        crate::store::write(dir.path(), &rust_doc).expect("write should succeed");
+        crate::store::write(dir.path(), &baking_doc).expect("write should succeed");
+        crate::embeddings::write(
+            dir.path(),
+            &rust_doc.slug,
+            &crate::embeddings::DocumentEmbeddings::build(&rust_doc).expect("build should succeed"),
+        )
+        .expect("write should succeed");
+        crate::embeddings::write(
+            dir.path(),
+            &baking_doc.slug,
+            &crate::embeddings::DocumentEmbeddings::build(&baking_doc).expect("build should succeed"),
+        )
+        .expect("write should succeed");
+
+        let structured = call_tool(
+            dir.path().to_path_buf(),
+            "search-semantic",
+            serde_json::json!({ "query": "systems programming in a strongly typed language", "top_k": 1 }),
+        )
+        .await
+        .expect("search-semantic tool call should succeed")
+        .structured_content
+        .expect("search-semantic tool should return structured content");
+
+        let hits = structured["hits"].as_array().expect("hits should be an array");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["document"]["id"], rust_doc.id);
+        assert_eq!(hits[0]["expanded_related"], serde_json::json!([]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_semantic_tool_expands_related_documents_when_asked() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let mut main_doc = crate::document::Document::new("Main", "Rust systems programming content.");
+        let related_doc = crate::document::Document::new("Related", "More Rust content.");
+        main_doc.related = vec![related_doc.id.clone()];
+        crate::store::write(dir.path(), &main_doc).expect("write should succeed");
+        crate::store::write(dir.path(), &related_doc).expect("write should succeed");
+        for doc in [&main_doc, &related_doc] {
+            crate::embeddings::write(
+                dir.path(),
+                &doc.slug,
+                &crate::embeddings::DocumentEmbeddings::build(doc).expect("build should succeed"),
+            )
+            .expect("write should succeed");
+        }
+
+        let structured = call_tool(
+            dir.path().to_path_buf(),
+            "search-semantic",
+            serde_json::json!({
+                "query": "rust systems programming",
+                "top_k": 1,
+                "expand_related": true,
+            }),
+        )
+        .await
+        .expect("search-semantic tool call should succeed")
+        .structured_content
+        .expect("search-semantic tool should return structured content");
+
+        let hits = structured["hits"].as_array().expect("hits should be an array");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["document"]["id"], main_doc.id);
+        let expanded = hits[0]["expanded_related"]
+            .as_array()
+            .expect("expanded_related should be an array");
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0]["id"], related_doc.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_semantic_search_tag_and_search_fulltext_are_registered_as_distinct_tools() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+
+        let server = HusmoServer::new(dir.path().to_path_buf());
+        let server_handle = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .expect("server should start")
+                .waiting()
+                .await
+                .expect("server should shut down cleanly");
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("client should connect");
+
+        let tools = client
+            .list_all_tools()
+            .await
+            .expect("list_all_tools should succeed");
+        let names: std::collections::HashSet<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
+
+        client.cancel().await.expect("client should shut down cleanly");
+        server_handle.await.expect("server task should not panic");
+
+        for expected in ["search-semantic", "search-tag", "search-fulltext"] {
+            assert!(
+                names.contains(expected),
+                "expected tool {expected:?} to be registered, got {names:?}"
+            );
+        }
     }
 }
