@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk::chunk;
 use crate::document::Document;
-use crate::embed::embed;
+use crate::embed::{EmbedError, embed};
 
 /// File extension used for chunk-embedding sidecar files, alongside each
 /// Document's own `{slug}.md` file.
@@ -46,19 +46,20 @@ impl DocumentEmbeddings {
     /// Chunks `document`'s content (via [`crate::chunk::chunk`]) and
     /// embeds every chunk (via [`crate::embed::embed`]), producing the
     /// full sidecar payload for it.
-    #[must_use]
-    pub fn build(document: &Document) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmbeddingsError::Embed`] if embedding any of the
+    /// Document's chunks fails.
+    pub fn build(document: &Document) -> Result<Self, EmbeddingsError> {
         let chunks = chunk(&document.content)
             .into_iter()
-            .map(|text| ChunkEmbedding {
-                vector: embed(&text),
-                chunk: text,
-            })
-            .collect();
-        DocumentEmbeddings {
+            .map(|text| Ok(ChunkEmbedding { vector: embed(&text)?, chunk: text }))
+            .collect::<Result<Vec<_>, EmbedError>>()?;
+        Ok(DocumentEmbeddings {
             document_id: document.id.clone(),
             chunks,
-        }
+        })
     }
 
     /// Serializes this value to the sidecar file's YAML contents.
@@ -84,8 +85,8 @@ impl DocumentEmbeddings {
     }
 }
 
-/// An error encountered while reading or writing a chunk-embedding
-/// sidecar file.
+/// An error encountered while building, reading, or writing a
+/// chunk-embedding sidecar file.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EmbeddingsError {
@@ -125,6 +126,9 @@ pub enum EmbeddingsError {
         #[source]
         source: std::io::Error,
     },
+    /// A chunk's embedding vector could not be computed.
+    #[error(transparent)]
+    Embed(#[from] EmbedError),
 }
 
 /// The path a sidecar file for `slug` would live at inside `dir`, e.g.
@@ -233,7 +237,7 @@ mod tests {
     fn build_chunks_and_embeds_a_documents_content() {
         let document = Document::new("My Title", "First paragraph.\n\nSecond paragraph.");
 
-        let embeddings = DocumentEmbeddings::build(&document);
+        let embeddings = DocumentEmbeddings::build(&document).expect("build should succeed");
 
         assert_eq!(embeddings.document_id, document.id);
         assert_eq!(
@@ -241,11 +245,11 @@ mod tests {
             vec![
                 ChunkEmbedding {
                     chunk: "First paragraph.".to_string(),
-                    vector: embed("First paragraph."),
+                    vector: embed("First paragraph.").expect("embed should succeed"),
                 },
                 ChunkEmbedding {
                     chunk: "Second paragraph.".to_string(),
-                    vector: embed("Second paragraph."),
+                    vector: embed("Second paragraph.").expect("embed should succeed"),
                 },
             ]
         );
@@ -255,7 +259,7 @@ mod tests {
     fn write_then_read_round_trips_a_sidecar_file() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let document = Document::new("My Title", "Some content.\n\nMore content.");
-        let embeddings = DocumentEmbeddings::build(&document);
+        let embeddings = DocumentEmbeddings::build(&document).expect("build should succeed");
 
         let path =
             write(dir.path(), &document.slug, &embeddings).expect("write should succeed");
@@ -278,8 +282,10 @@ mod tests {
     #[test]
     fn load_all_reads_every_sidecar_file_in_a_directory() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let one = DocumentEmbeddings::build(&Document::new("One", "First document."));
-        let two = DocumentEmbeddings::build(&Document::new("Two", "Second document."));
+        let one = DocumentEmbeddings::build(&Document::new("One", "First document."))
+            .expect("build should succeed");
+        let two = DocumentEmbeddings::build(&Document::new("Two", "Second document."))
+            .expect("build should succeed");
         write(dir.path(), "one", &one).expect("write should succeed");
         write(dir.path(), "two", &two).expect("write should succeed");
         std::fs::write(dir.path().join("one.md"), "not a sidecar file")

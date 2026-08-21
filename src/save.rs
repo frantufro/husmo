@@ -166,7 +166,7 @@ pub fn save(dir: &Path, input: SaveInput, tags: Vec<String>) -> Result<SaveOutpu
     document.tags = tags;
 
     store::write(dir, &document)?;
-    let embeddings = DocumentEmbeddings::build(&document);
+    let embeddings = DocumentEmbeddings::build(&document)?;
     embeddings::write(dir, &document.slug, &embeddings)?;
 
     Ok(SaveOutput {

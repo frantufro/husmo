@@ -93,7 +93,7 @@ pub fn archive_outgoing_link(dir: &Path, link: &OutgoingLink) -> Result<Archived
     let (document, outgoing_links) = fetch_and_build_document(dir, &link.url, &link.text)?;
 
     store::write(dir, &document)?;
-    let embeddings = DocumentEmbeddings::build(&document);
+    let embeddings = DocumentEmbeddings::build(&document)?;
     crate::embeddings::write(dir, &document.slug, &embeddings)?;
 
     Ok(ArchivedLink {

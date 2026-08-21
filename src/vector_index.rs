@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use crate::embed::embed;
+use crate::embed::{EmbedError, embed};
 use crate::embeddings::{DocumentEmbeddings, EmbeddingsError};
 
 /// One chunk's embedding, tagged with the Document it came from.
@@ -66,9 +66,13 @@ impl VectorIndex {
     /// Returns the `top_k` chunks in the index most similar to `query`, by
     /// cosine similarity, most similar first. Returns fewer than `top_k`
     /// if the index doesn't hold that many chunks.
-    #[must_use]
-    pub fn search(&self, query: &str, top_k: usize) -> Vec<SearchHit> {
-        let query_vector = embed(query);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `query` can't be embedded (see
+    /// [`crate::embed::embed`]).
+    pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>, EmbedError> {
+        let query_vector = embed(query)?;
         let mut hits: Vec<SearchHit> = self
             .chunks
             .iter()
@@ -80,7 +84,7 @@ impl VectorIndex {
             .collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score));
         hits.truncate(top_k);
-        hits
+        Ok(hits)
     }
 }
 
@@ -128,7 +132,7 @@ mod tests {
                 .iter()
                 .map(|text| ChunkEmbedding {
                     chunk: text.to_string(),
-                    vector: embed(text),
+                    vector: embed(text).expect("embed should succeed"),
                 })
                 .collect(),
         }
@@ -145,7 +149,9 @@ mod tests {
         ];
         let index = VectorIndex::build(&embeddings);
 
-        let hits = index.search("systems programming in a strongly typed language", 2);
+        let hits = index
+            .search("systems programming in a strongly typed language", 2)
+            .expect("search should succeed");
 
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].document_id, "rust-doc");
@@ -163,7 +169,7 @@ mod tests {
         let embeddings = vec![fixture("doc", &["alpha", "beta", "gamma"])];
         let index = VectorIndex::build(&embeddings);
 
-        let hits = index.search("alpha", 1);
+        let hits = index.search("alpha", 1).expect("search should succeed");
 
         assert_eq!(hits.len(), 1);
     }
@@ -173,7 +179,7 @@ mod tests {
         let embeddings = vec![fixture("doc", &["only chunk"])];
         let index = VectorIndex::build(&embeddings);
 
-        let hits = index.search("only chunk", 5);
+        let hits = index.search("only chunk", 5).expect("search should succeed");
 
         assert_eq!(hits.len(), 1);
     }
@@ -202,18 +208,20 @@ mod tests {
         crate::embeddings::write(
             dir.path(),
             &rust_doc.slug,
-            &DocumentEmbeddings::build(&rust_doc),
+            &DocumentEmbeddings::build(&rust_doc).expect("build should succeed"),
         )
         .expect("write should succeed");
         crate::embeddings::write(
             dir.path(),
             &baking_doc.slug,
-            &DocumentEmbeddings::build(&baking_doc),
+            &DocumentEmbeddings::build(&baking_doc).expect("build should succeed"),
         )
         .expect("write should succeed");
 
         let index = build_from_dir(dir.path()).expect("build_from_dir should succeed");
-        let hits = index.search("systems programming in a strongly typed language", 1);
+        let hits = index
+            .search("systems programming in a strongly typed language", 1)
+            .expect("search should succeed");
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].document_id, rust_doc.id);

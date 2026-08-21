@@ -13,6 +13,7 @@
 use std::collections::HashSet;
 
 use crate::document::Document;
+use crate::embed::EmbedError;
 use crate::vector_index::VectorIndex;
 
 /// One Document that matched a [`semantic_search`] query.
@@ -45,14 +46,18 @@ pub struct SemanticSearchHit {
 /// the full content of every Document referenced in its `document.related`
 /// that's present in `documents`; when `false`, `expanded_related` is
 /// always empty.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns an error if `query` can't be embedded (see
+/// [`crate::vector_index::VectorIndex::search`]).
 pub fn semantic_search(
     index: &VectorIndex,
     documents: &[Document],
     query: &str,
     top_k: usize,
     expand_related: bool,
-) -> Vec<SemanticSearchHit> {
+) -> Result<Vec<SemanticSearchHit>, EmbedError> {
     let mut seen_documents = HashSet::new();
     let mut hits = Vec::new();
 
@@ -60,7 +65,7 @@ pub fn semantic_search(
     // time a document_id appears in that order is necessarily its
     // best-scoring chunk, and dedup-by-first-occurrence yields documents
     // already in descending order of their own best score.
-    for chunk_hit in index.search(query, index.len()) {
+    for chunk_hit in index.search(query, index.len())? {
         if hits.len() >= top_k {
             break;
         }
@@ -83,7 +88,7 @@ pub fn semantic_search(
         });
     }
 
-    hits
+    Ok(hits)
 }
 
 /// Resolves every id in `document.related` to its full Document, looking
@@ -113,8 +118,8 @@ mod tests {
             Document::new("Bread", "Bake the sourdough loaf for forty minutes at high heat.");
         let documents = vec![rust_doc.clone(), baking_doc.clone()];
         let index = VectorIndex::build(&[
-            DocumentEmbeddings::build(&rust_doc),
-            DocumentEmbeddings::build(&baking_doc),
+            DocumentEmbeddings::build(&rust_doc).expect("build should succeed"),
+            DocumentEmbeddings::build(&baking_doc).expect("build should succeed"),
         ]);
 
         let hits = semantic_search(
@@ -123,7 +128,8 @@ mod tests {
             "systems programming in a strongly typed language",
             2,
             false,
-        );
+        )
+        .expect("semantic_search should succeed");
 
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].document.id, rust_doc.id);
@@ -145,11 +151,12 @@ mod tests {
         let baking_doc = Document::new("Bread", "Sourdough baking is a slow art.");
         let documents = vec![rust_doc.clone(), baking_doc.clone()];
         let index = VectorIndex::build(&[
-            DocumentEmbeddings::build(&rust_doc),
-            DocumentEmbeddings::build(&baking_doc),
+            DocumentEmbeddings::build(&rust_doc).expect("build should succeed"),
+            DocumentEmbeddings::build(&baking_doc).expect("build should succeed"),
         ]);
 
-        let hits = semantic_search(&index, &documents, "rust", 2, false);
+        let hits = semantic_search(&index, &documents, "rust", 2, false)
+            .expect("semantic_search should succeed");
 
         assert_eq!(hits.len(), 2);
         let document_ids: HashSet<_> = hits.iter().map(|hit| hit.document.id.clone()).collect();
@@ -166,11 +173,12 @@ mod tests {
         main_doc.related = vec![related_doc.id.clone()];
         let documents = vec![main_doc.clone(), related_doc.clone()];
         let index = VectorIndex::build(&[
-            DocumentEmbeddings::build(&main_doc),
-            DocumentEmbeddings::build(&related_doc),
+            DocumentEmbeddings::build(&main_doc).expect("build should succeed"),
+            DocumentEmbeddings::build(&related_doc).expect("build should succeed"),
         ]);
 
-        let hits = semantic_search(&index, &documents, "rust systems programming", 1, false);
+        let hits = semantic_search(&index, &documents, "rust systems programming", 1, false)
+            .expect("semantic_search should succeed");
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].document.id, main_doc.id);
@@ -185,11 +193,12 @@ mod tests {
         main_doc.related = vec![related_doc.id.clone()];
         let documents = vec![main_doc.clone(), related_doc.clone()];
         let index = VectorIndex::build(&[
-            DocumentEmbeddings::build(&main_doc),
-            DocumentEmbeddings::build(&related_doc),
+            DocumentEmbeddings::build(&main_doc).expect("build should succeed"),
+            DocumentEmbeddings::build(&related_doc).expect("build should succeed"),
         ]);
 
-        let hits = semantic_search(&index, &documents, "rust systems programming", 1, true);
+        let hits = semantic_search(&index, &documents, "rust systems programming", 1, true)
+            .expect("semantic_search should succeed");
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].expanded_related, vec![related_doc]);
@@ -200,9 +209,11 @@ mod tests {
         let mut main_doc = Document::new("Main", "Rust systems programming content.");
         main_doc.related = vec!["missing-id".to_string()];
         let documents = vec![main_doc.clone()];
-        let index = VectorIndex::build(&[DocumentEmbeddings::build(&main_doc)]);
+        let index =
+            VectorIndex::build(&[DocumentEmbeddings::build(&main_doc).expect("build should succeed")]);
 
-        let hits = semantic_search(&index, &documents, "rust systems programming", 1, true);
+        let hits = semantic_search(&index, &documents, "rust systems programming", 1, true)
+            .expect("semantic_search should succeed");
 
         assert_eq!(hits.len(), 1);
         assert!(hits[0].expanded_related.is_empty());
