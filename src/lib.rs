@@ -15,6 +15,7 @@ pub mod fetch;
 pub mod fulltext_search;
 pub mod git_sync;
 pub mod images;
+pub mod init;
 pub mod local_file;
 pub mod mcp_server;
 pub mod pasted_text;

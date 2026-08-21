@@ -4,14 +4,14 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Application configuration.
 ///
 /// Currently just the data repo path, per `docs/ARCHITECTURE.md`: "Its path
 /// is supplied via a config file — the app should never hardcode a data
 /// repo location."
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Config {
     /// Filesystem path to the data repo (the git-tracked store of
