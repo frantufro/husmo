@@ -6,5 +6,7 @@
 
 pub mod config;
 pub mod document;
+pub mod extract;
+pub mod fetch;
 pub mod git_sync;
 pub mod store;
