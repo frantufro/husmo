@@ -4,6 +4,13 @@
 //! are also collected separately so a caller can decide whether to archive
 //! one as its own Document later — one level deep, on request only. This
 //! module never follows a link itself.
+//!
+//! Images are handled the same way, minus the deferral: every `<img>` is
+//! rendered as a Markdown image and also collected into
+//! [`Extracted::images`], still pointing at its original remote URL. This
+//! module performs no network or filesystem I/O itself — downloading each
+//! image's bytes and rewriting the Markdown to point at local copies is
+//! [`crate::images::localize_images`]'s job.
 
 use std::fmt::Write as _;
 
@@ -25,6 +32,23 @@ pub struct Extracted {
     /// Document later, one level deep, never automatically (see
     /// `docs/ARCHITECTURE.md`, "Content extraction").
     pub outgoing_links: Vec<OutgoingLink>,
+    /// Every image discovered in the content, in the order they appear.
+    /// `markdown` still points at each image's original remote URL —
+    /// downloading the bytes and rewriting those references to local
+    /// copies is [`crate::images::localize_images`]'s job, kept out of this
+    /// module so extraction itself stays free of network and filesystem
+    /// I/O.
+    pub images: Vec<ExtractedImage>,
+}
+
+/// One image discovered in a page's content during extraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedImage {
+    /// The image's `alt` text, if present (empty string otherwise).
+    pub alt: String,
+    /// The image's source, resolved to an absolute URL against the page it
+    /// was found on.
+    pub url: String,
 }
 
 /// One hyperlink discovered in a page's content during extraction.
@@ -49,9 +73,11 @@ const DROPPED_ELEMENTS: &[&str] = &[
 /// Picks the main content root as the first of `<article>`, `<main>`, or
 /// `<body>` present in the document, then walks it converting headings,
 /// paragraphs, emphasis, and lists to Markdown while preserving hyperlinks
-/// inline and collecting them into `outgoing_links`. `page_url` is used
-/// only to resolve relative hrefs to absolute URLs; it is not fetched by
-/// this function (see [`crate::fetch`] for that).
+/// and images inline and collecting them into `outgoing_links` and
+/// `images` respectively. `page_url` is used only to resolve relative
+/// `href`/`src` attributes to absolute URLs; it is not fetched by this
+/// function (see [`crate::fetch`] for that), and no image bytes are
+/// downloaded here either (see [`crate::images`] for that).
 #[must_use]
 pub fn extract(html: &str, page_url: &str) -> Extracted {
     let document = Html::parse_document(html);
@@ -59,18 +85,30 @@ pub fn extract(html: &str, page_url: &str) -> Extracted {
     let title = title_text(&document);
 
     let mut markdown = String::new();
-    let mut outgoing_links = Vec::new();
+    let mut collected = Collected::default();
     if let Some(root) = main_content_root(&document) {
         for child in root.children() {
-            render_node(child, base.as_ref(), &mut markdown, &mut outgoing_links);
+            render_node(child, base.as_ref(), &mut markdown, &mut collected);
         }
     }
 
     Extracted {
         title,
         markdown: normalize(&markdown),
-        outgoing_links,
+        outgoing_links: collected.links,
+        images: collected.images,
     }
+}
+
+/// Accumulates the outgoing links and images discovered while walking a
+/// page's DOM, threaded through the render functions below as a single
+/// mutable parameter rather than one per kind of thing collected.
+#[derive(Debug, Default)]
+struct Collected {
+    /// Outgoing hyperlinks discovered so far, in document order.
+    links: Vec<OutgoingLink>,
+    /// Images discovered so far, in document order.
+    images: Vec<ExtractedImage>,
 }
 
 /// Extracts the trimmed text of the document's `<title>` element, if any
@@ -97,7 +135,7 @@ fn render_node(
     node: ego_tree::NodeRef<'_, Node>,
     base: Option<&Url>,
     out: &mut String,
-    links: &mut Vec<OutgoingLink>,
+    collected: &mut Collected,
 ) {
     match node.value() {
         Node::Text(text) => out.push_str(text),
@@ -105,7 +143,7 @@ fn render_node(
             let Some(element_ref) = ElementRef::wrap(node) else {
                 return;
             };
-            render_element(element_ref, base, out, links);
+            render_element(element_ref, base, out, collected);
         }
         // Comments, doctypes, and processing instructions carry nothing
         // readability-relevant.
@@ -120,10 +158,10 @@ fn render_children(
     node: ego_tree::NodeRef<'_, Node>,
     base: Option<&Url>,
     out: &mut String,
-    links: &mut Vec<OutgoingLink>,
+    collected: &mut Collected,
 ) {
     for child in node.children() {
-        render_node(child, base, out, links);
+        render_node(child, base, out, collected);
     }
 }
 
@@ -133,10 +171,10 @@ fn render_children(
 fn render_children_to_string(
     node: ElementRef<'_>,
     base: Option<&Url>,
-    links: &mut Vec<OutgoingLink>,
+    collected: &mut Collected,
 ) -> String {
     let mut inner = String::new();
-    render_children(*node, base, &mut inner, links);
+    render_children(*node, base, &mut inner, collected);
     collapse_whitespace(&inner)
 }
 
@@ -155,7 +193,7 @@ fn render_element(
     element: ElementRef<'_>,
     base: Option<&Url>,
     out: &mut String,
-    links: &mut Vec<OutgoingLink>,
+    collected: &mut Collected,
 ) {
     let name = element.value().name();
 
@@ -170,36 +208,34 @@ fn render_element(
             start_block(out);
             out.push_str(&"#".repeat(level));
             out.push(' ');
-            render_children(*element, base, out, links);
+            render_children(*element, base, out, collected);
         }
         "p" => {
             start_block(out);
-            render_children(*element, base, out, links);
+            render_children(*element, base, out, collected);
         }
         "br" => out.push('\n'),
         "hr" => {
             start_block(out);
             out.push_str("---");
         }
-        "strong" | "b" => wrap_inline(element, base, "**", out, links),
-        "em" | "i" => wrap_inline(element, base, "*", out, links),
-        "code" => wrap_inline(element, base, "`", out, links),
+        "strong" | "b" => wrap_inline(element, base, "**", out, collected),
+        "em" | "i" => wrap_inline(element, base, "*", out, collected),
+        "code" => wrap_inline(element, base, "`", out, collected),
         "ul" => {
             start_block(out);
-            render_list(element, base, false, out, links);
+            render_list(element, base, false, out, collected);
         }
         "ol" => {
             start_block(out);
-            render_list(element, base, true, out, links);
+            render_list(element, base, true, out, collected);
         }
-        "a" => render_link(element, base, out, links),
-        // Image bytes and local rewriting are a later roadmap task
-        // ("image handling during extraction"); this pass just drops them.
-        "img" => {}
+        "a" => render_link(element, base, out, collected),
+        "img" => render_image(element, base, out, collected),
         // Transparent containers (div, span, section, article, main, body,
         // blockquote, figure, table cells, ...): render their content
         // without adding markup of their own.
-        _ => render_children(*element, base, out, links),
+        _ => render_children(*element, base, out, collected),
     }
 }
 
@@ -212,9 +248,9 @@ fn wrap_inline(
     base: Option<&Url>,
     marker: &str,
     out: &mut String,
-    links: &mut Vec<OutgoingLink>,
+    collected: &mut Collected,
 ) {
-    let inner = render_children_to_string(element, base, links);
+    let inner = render_children_to_string(element, base, collected);
     if inner.is_empty() {
         return;
     }
@@ -234,9 +270,9 @@ fn render_link(
     element: ElementRef<'_>,
     base: Option<&Url>,
     out: &mut String,
-    links: &mut Vec<OutgoingLink>,
+    collected: &mut Collected,
 ) {
-    let text = render_children_to_string(element, base, links);
+    let text = render_children_to_string(element, base, collected);
     let href = element.value().attr("href");
     let resolved = href.and_then(|href| resolve_url(base, href));
 
@@ -249,7 +285,7 @@ fn render_link(
     let display_text = if text.is_empty() { url.clone() } else { text };
     let is_http = resolved_url.scheme() == "http" || resolved_url.scheme() == "https";
     if is_http && !is_same_page_fragment(base, &resolved_url) {
-        links.push(OutgoingLink {
+        collected.links.push(OutgoingLink {
             text: display_text.clone(),
             url: url.clone(),
         });
@@ -257,6 +293,44 @@ fn render_link(
 
     out.push('[');
     out.push_str(&display_text);
+    out.push_str("](");
+    out.push_str(&url);
+    out.push(')');
+}
+
+/// Renders an `<img>` element as a Markdown image (`![alt](url)`),
+/// resolving its `src` against `base` the same way [`render_link`] resolves
+/// an `<a>`'s `href`. Emits nothing if there's no `src` or it can't be
+/// resolved to a URL — an `<img>` has no fallback text to fall back to.
+/// Also records the image in `images` so a caller can download its bytes
+/// and rewrite this reference to a local copy later (see
+/// `crate::images::localize_images`); unlike [`render_link`]'s outgoing
+/// links, every resolved image is recorded — there's no non-`http`/
+/// same-page-fragment case to exclude here.
+fn render_image(
+    element: ElementRef<'_>,
+    base: Option<&Url>,
+    out: &mut String,
+    collected: &mut Collected,
+) {
+    let src = element.value().attr("src");
+    let Some(resolved_url) = src.and_then(|src| resolve_url(base, src)) else {
+        return;
+    };
+    let alt = element
+        .value()
+        .attr("alt")
+        .map(collapse_whitespace)
+        .unwrap_or_default();
+    let url = resolved_url.to_string();
+
+    collected.images.push(ExtractedImage {
+        alt: alt.clone(),
+        url: url.clone(),
+    });
+
+    out.push_str("![");
+    out.push_str(&alt);
     out.push_str("](");
     out.push_str(&url);
     out.push(')');
@@ -292,14 +366,14 @@ fn render_list(
     base: Option<&Url>,
     ordered: bool,
     out: &mut String,
-    links: &mut Vec<OutgoingLink>,
+    collected: &mut Collected,
 ) {
     let mut number = 1u32;
     for child in element.child_elements() {
         if child.value().name() != "li" {
             continue;
         }
-        let item = render_children_to_string(child, base, links);
+        let item = render_children_to_string(child, base, collected);
         if ordered {
             let _ = writeln!(out, "{number}. {item}");
             number += 1;
@@ -527,6 +601,27 @@ mod tests {
         let with_only_body =
             extract("<html><body><p>Just body content.</p></body></html>", "https://example.com/post");
         assert_eq!(with_only_body.markdown, "Just body content.");
+    }
+
+    #[test]
+    fn extract_renders_images_as_markdown_and_collects_them_as_data() {
+        let html = "<html><body><article>\
+            <p><img src=\"/cat.png\" alt=\"A cat\"></p>\
+            </article></body></html>";
+
+        let extracted = extract(html, "https://example.com/post");
+
+        assert_eq!(
+            extracted.markdown,
+            "![A cat](https://example.com/cat.png)"
+        );
+        assert_eq!(
+            extracted.images,
+            vec![ExtractedImage {
+                alt: "A cat".to_string(),
+                url: "https://example.com/cat.png".to_string(),
+            }]
+        );
     }
 
     #[test]
