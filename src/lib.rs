@@ -21,6 +21,7 @@ pub mod local_file;
 pub mod mcp_server;
 pub mod pasted_text;
 pub mod related;
+pub mod resources;
 pub mod save;
 pub mod semantic_search;
 pub mod store;

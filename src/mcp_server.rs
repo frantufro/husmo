@@ -15,7 +15,13 @@ use std::path::PathBuf;
 
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    Implementation, ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+    ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +33,7 @@ use crate::extract::OutgoingLink;
 use crate::fulltext_search::{self, FullTextSearchHit};
 use crate::git_sync::{self, SyncError};
 use crate::related::{self, RelateError};
+use crate::resources;
 use crate::save::{self, SaveError, SaveInput};
 use crate::semantic_search::{self, SemanticSearchHit};
 use crate::store::{self, IdentifierError, ResolveError, StoreError};
@@ -784,11 +791,90 @@ fn embeddings_error_to_mcp_error(error: &EmbeddingsError) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
 }
 
-#[tool_handler(
-    instructions = "husmo: a local-first, git-backed document/link database. See \
-        docs/ARCHITECTURE.md for the full tool surface."
-)]
-impl ServerHandler for HusmoServer {}
+/// The `#[tool_handler]` attribute's `instructions` parameter only feeds
+/// its own auto-generated `get_info`; since `get_info` is overridden below
+/// (to also advertise the `resources` capability), that parameter would go
+/// unused, so this instructions string lives directly in
+/// [`HusmoServer::get_info`] instead of the attribute.
+#[tool_handler]
+impl ServerHandler for HusmoServer {
+    /// Advertises both the `tools` and `resources` capabilities. The
+    /// `#[tool_handler]` macro only auto-generates `get_info` when this
+    /// method is absent, and its auto-generated version only enables
+    /// `tools` — overriding it here is the one thing this `impl` needs to
+    /// add for Documents' resources to be advertised at all, since a
+    /// resource-aware client checks capabilities before ever calling
+    /// `resources/list`.
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::from_build_env())
+        .with_instructions(
+            "husmo: a local-first, git-backed document/link database. See \
+             docs/ARCHITECTURE.md for the full tool surface."
+                .to_string(),
+        )
+    }
+
+    /// Lists Documents as MCP resources, alongside the `list` tool — a
+    /// second, additional interface over the same `crate::store` code, per
+    /// `docs/adr/0002-mcp-resources-alongside-tools-for-document-browsing.md`.
+    /// Paginated from the start via `crate::resources::paginate`, even
+    /// though today's scale doesn't require it (see that ADR).
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let documents =
+            store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let cursor = request.and_then(|params| params.cursor);
+        let page = resources::paginate(documents, cursor.as_deref(), resources::DEFAULT_PAGE_SIZE);
+
+        let resource_list: Vec<Resource> = page
+            .documents
+            .into_iter()
+            .map(|document| {
+                let description = resources::resource_description(&document);
+                Resource::new(resources::resource_uri(&document.slug), document.title)
+                    .with_description(description)
+                    .with_mime_type("text/markdown")
+            })
+            .collect();
+
+        let mut result = ListResourcesResult::with_all_items(resource_list);
+        result.next_cursor = page.next_cursor;
+        Ok(result)
+    }
+
+    /// Reads one Document as an MCP resource, identified by `request.uri`'s
+    /// slug (see `crate::resources::slug_from_uri`). Returns the same shape
+    /// `get` does: the raw on-disk Markdown-with-frontmatter, Related
+    /// Documents left as bare ids in the frontmatter rather than inlined,
+    /// per the same ADR.
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let slug = resources::slug_from_uri(&request.uri).ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("not a Document resource uri: {:?}", request.uri),
+                None,
+            )
+        })?;
+        let document = store::resolve(&self.data_repo_path, &store::Identifier::Slug(slug.to_string()))
+            .map_err(|error| resolve_error_to_mcp_error(&error))?;
+
+        let contents =
+            ResourceContents::text(document.to_markdown(), request.uri).with_mime_type("text/markdown");
+        Ok(ReadResourceResult::new(vec![contents]).into())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1655,6 +1741,203 @@ mod tests {
         assert!(
             result.is_err(),
             "calling delete with an identifier matching no Document should fail, got {result:?}"
+        );
+    }
+
+    /// Connects a fresh `HusmoServer` rooted at `data_repo_path` to a
+    /// `TestClient` over a real (in-memory) MCP client/server connection,
+    /// returning the connected client and the server's join handle. Callers
+    /// drive `resources/list`/`resources/read` directly on `client` (`rmcp`
+    /// exposes both as high-level methods), then must `client.cancel()` and
+    /// await `server_handle` themselves, the same teardown [`call_tool`] and
+    /// friends perform internally for tool calls.
+    async fn connect(
+        data_repo_path: PathBuf,
+    ) -> (
+        rmcp::service::RunningService<rmcp::RoleClient, TestClient>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+
+        let server = HusmoServer::new(data_repo_path);
+        let server_handle = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .expect("server should start")
+                .waiting()
+                .await
+                .expect("server should shut down cleanly");
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("client should connect");
+
+        (client, server_handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_list_returns_every_document_keyed_by_slug() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let mut with_summary = crate::document::Document::new("With Summary", "Body content.");
+        with_summary.summary = Some("A short summary.".to_string());
+        let without_summary =
+            crate::document::Document::new("Without Summary", "The body content used as a snippet.");
+        crate::store::write(dir.path(), &with_summary).expect("write should succeed");
+        crate::store::write(dir.path(), &without_summary).expect("write should succeed");
+
+        let (client, server_handle) = connect(dir.path().to_path_buf()).await;
+        let result = client
+            .list_resources(None)
+            .await
+            .expect("resources/list should succeed");
+        client.cancel().await.expect("client should shut down cleanly");
+        server_handle.await.expect("server task should not panic");
+
+        assert_eq!(result.resources.len(), 2);
+        let by_uri: std::collections::HashMap<String, &rmcp::model::Resource> =
+            result.resources.iter().map(|resource| (resource.uri.clone(), resource)).collect();
+
+        let with_summary_uri = crate::resources::resource_uri(&with_summary.slug);
+        let with_summary_resource = by_uri
+            .get(&with_summary_uri)
+            .expect("the summarized Document should be listed under its slug's uri");
+        assert_eq!(with_summary_resource.name, "With Summary");
+        assert_eq!(
+            with_summary_resource.description,
+            Some("A short summary.".to_string())
+        );
+
+        let without_summary_uri = crate::resources::resource_uri(&without_summary.slug);
+        let without_summary_resource = by_uri
+            .get(&without_summary_uri)
+            .expect("the unsummarized Document should be listed under its slug's uri");
+        assert_eq!(
+            without_summary_resource.description,
+            Some("The body content used as a snippet.".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_list_paginates_via_cursor() {
+        // The page size (`crate::resources::DEFAULT_PAGE_SIZE`) comfortably
+        // covers both Documents below, so `resources/list` wouldn't split
+        // them into separate pages on its own; passing a cursor "aaa" by
+        // hand, as a resource-aware client would on its second call,
+        // exercises the cursor-based resume path itself instead.
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let mut aaa = crate::document::Document::new("Aaa", "content");
+        aaa.slug = "aaa".to_string();
+        let mut bbb = crate::document::Document::new("Bbb", "content");
+        bbb.slug = "bbb".to_string();
+        crate::store::write(dir.path(), &aaa).expect("write should succeed");
+        crate::store::write(dir.path(), &bbb).expect("write should succeed");
+
+        let (client, server_handle) = connect(dir.path().to_path_buf()).await;
+        let page = client
+            .list_resources(Some(
+                rmcp::model::PaginatedRequestParams::default().with_cursor(Some("aaa".to_string())),
+            ))
+            .await
+            .expect("resources/list with a cursor should succeed");
+        client.cancel().await.expect("client should shut down cleanly");
+        server_handle.await.expect("server task should not panic");
+
+        let uris: Vec<String> = page.resources.iter().map(|resource| resource.uri.clone()).collect();
+        assert_eq!(uris, vec![crate::resources::resource_uri("bbb")]);
+        assert_eq!(
+            page.next_cursor, None,
+            "the second page should be the last one, with no further cursor"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_read_returns_the_raw_markdown_for_a_document() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let mut doc_a = crate::document::Document::new("A", "content a");
+        let doc_b = crate::document::Document::new("B", "content b");
+        doc_a.related = vec![doc_b.id.clone()];
+        crate::store::write(dir.path(), &doc_a).expect("write should succeed");
+        crate::store::write(dir.path(), &doc_b).expect("write should succeed");
+
+        let (client, server_handle) = connect(dir.path().to_path_buf()).await;
+        let uri = crate::resources::resource_uri(&doc_a.slug);
+        let result = client
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(uri.clone()))
+            .await
+            .expect("resources/read should succeed");
+        client.cancel().await.expect("client should shut down cleanly");
+        server_handle.await.expect("server task should not panic");
+
+        assert_eq!(result.contents.len(), 1);
+        match &result.contents[0] {
+            rmcp::model::ResourceContents::TextResourceContents { text, mime_type, uri: content_uri, .. } => {
+                assert_eq!(content_uri, &uri);
+                assert_eq!(mime_type.as_deref(), Some("text/markdown"));
+                assert_eq!(text, &doc_a.to_markdown());
+                // Related is listed by reference (a bare id in the
+                // frontmatter) rather than inlined.
+                assert!(text.contains(&doc_b.id));
+                assert!(!text.contains("content b"));
+            }
+            other => panic!("expected text contents, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_read_reports_a_not_found_error_for_an_unknown_slug() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let (client, server_handle) = connect(dir.path().to_path_buf()).await;
+        let result = client
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(
+                crate::resources::resource_uri("does-not-exist"),
+            ))
+            .await;
+        client.cancel().await.expect("client should shut down cleanly");
+        server_handle.await.expect("server task should not panic");
+
+        assert!(
+            result.is_err(),
+            "reading an unknown slug's resource should fail, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_read_rejects_a_uri_that_is_not_a_document_uri() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let (client, server_handle) = connect(dir.path().to_path_buf()).await;
+        let result = client
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(
+                "https://example.com/not-a-document-uri".to_string(),
+            ))
+            .await;
+        client.cancel().await.expect("client should shut down cleanly");
+        server_handle.await.expect("server task should not panic");
+
+        assert!(
+            result.is_err(),
+            "reading a uri outside the document:// scheme should fail, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_info_advertises_the_resources_capability() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let (client, server_handle) = connect(dir.path().to_path_buf()).await;
+        let info = client.peer_info();
+        client.cancel().await.expect("client should shut down cleanly");
+        server_handle.await.expect("server task should not panic");
+
+        let info = info.expect("the client should have captured the server's InitializeResult");
+        assert!(
+            info.capabilities.resources.is_some(),
+            "expected the server to advertise the resources capability, got {:?}",
+            info.capabilities
         );
     }
 }
