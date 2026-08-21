@@ -1,0 +1,3 @@
+# Local-first: no external services for embeddings or search
+
+Being fully local and self-contained is a core value of this project: saved Documents may include private or work content, and the tool should work offline with no per-save cost. We chose in-process, local embedding generation (via a Rust-native model, e.g. through `candle`) over API-based providers (Voyage AI, OpenAI), and an in-process embeddable vector index (e.g. `usearch`) over a separate vector database service (e.g. Qdrant). The trade-off is embedding quality and index scalability versus privacy, offline use, and operational simplicity — for a personal archive at personal scale, that trade favors locality.
