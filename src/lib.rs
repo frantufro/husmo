@@ -6,4 +6,5 @@
 
 pub mod config;
 pub mod document;
+pub mod git_sync;
 pub mod store;

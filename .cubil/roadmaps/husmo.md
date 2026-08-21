@@ -13,8 +13,9 @@ and fixed before being marked done.
 
 ## Milestone: Foundation & Ingestion
 - [✓] scaffold-husmo-rust-project — Scaffold husmo Rust project
-- [~] document-model-and-file-i-o — Document model and file I/O
-- [ ] git-backed-persistence-wrapper — Git-backed persistence wrapper
+- [✓] document-model-and-file-i-o — Document model and file I/O
+- [ ] husmo-init-clone-data-repo-and-write-config — husmo init: clone data repo and write config
+- [~] git-backed-persistence-wrapper — Git-backed persistence wrapper
 - [ ] url-ingestion-fetch-and-extraction — URL ingestion: fetch and extraction
 - [ ] image-handling-during-extraction — Image handling during extraction
 - [ ] local-file-ingestion-text-and-pdf — Local file ingestion (text and PDF)

@@ -32,6 +32,17 @@ Two repositories:
 - Identity resolution (used by `get` and internally) accepts exactly one of
   `id` / `slug` / `url` and resolves to the same Document.
 
+## Bootstrapping a data repo: `husmo init`
+
+A CLI subcommand (not an MCP tool) that bootstraps the data repo on a new
+machine/folder:
+- Prompts interactively for the data repo's git URL (also accepts it via a
+  `--repo <url>` flag for scripted/non-interactive use).
+- Clones it into the current directory.
+- Writes/updates the config file (see "Repo split" above) to point at the
+  cloned path, so the app has a working data repo location immediately
+  after `init` completes — no separate manual config-editing step.
+
 ## Content extraction
 
 - URL fetch: plain HTTP via `reqwest` — **no headless browser, no JS
