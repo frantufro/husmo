@@ -19,12 +19,14 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::delete::DeleteError;
 use crate::document::Document;
 use crate::embed::EmbedError;
 use crate::embeddings::EmbeddingsError;
 use crate::extract::OutgoingLink;
 use crate::fulltext_search::{self, FullTextSearchHit};
 use crate::git_sync::{self, SyncError};
+use crate::related::{self, RelateError};
 use crate::save::{self, SaveError, SaveInput};
 use crate::semantic_search::{self, SemanticSearchHit};
 use crate::store::{self, IdentifierError, ResolveError, StoreError};
@@ -302,6 +304,51 @@ pub struct SearchFulltextResult {
     pub hits: Vec<FulltextSearchHitDto>,
 }
 
+/// The `list` tool's result.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ListResult {
+    /// Every Document in the data repo.
+    pub documents: Vec<DocumentDto>,
+}
+
+/// Parameters for the `relate` and `unrelate` tools: the two Documents' own
+/// stable ids, wired directly onto `crate::related::relate`/`unrelate`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RelateParams {
+    /// The first Document's id.
+    pub id_a: String,
+    /// The second Document's id.
+    pub id_b: String,
+}
+
+/// The `relate`/`unrelate` tools' result: both Documents as they stand
+/// after the edge was declared or removed.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RelateResult {
+    /// The first Document (`id_a`), after the edge was declared/removed.
+    pub document_a: DocumentDto,
+    /// The second Document (`id_b`), after the edge was declared/removed.
+    pub document_b: DocumentDto,
+}
+
+/// Parameters for the `delete` tool. Exactly one of `id`/`slug`/`url` is
+/// required, validated server-side by [`crate::store::identifier`].
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteParams {
+    /// The Document's stable internal id. Exactly one of `id`, `slug`, or
+    /// `url` is required.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The Document's slug. Exactly one of `id`, `slug`, or `url` is
+    /// required.
+    #[serde(default)]
+    pub slug: Option<String>,
+    /// The Document's canonical URL. Exactly one of `id`, `slug`, or `url`
+    /// is required.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
 #[tool_router]
 impl HusmoServer {
     /// Saves a URL, pasted text, or local file as a Document: dispatches
@@ -466,6 +513,112 @@ impl HusmoServer {
             .collect();
         Ok(Json(SearchFulltextResult { hits }))
     }
+
+    /// Lists every Document in the data repo, per `docs/ARCHITECTURE.md`
+    /// ("MCP server"): "`list`" (browse all Documents). A pure local read,
+    /// so it runs directly rather than on the blocking thread pool.
+    #[tool(description = "List every Document in the data repo, including each one's \
+        Related list by reference.")]
+    async fn list(&self) -> Result<Json<ListResult>, ErrorData> {
+        let documents = store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let dtos = documents
+            .clone()
+            .into_iter()
+            .map(|document| Self::document_to_dto(document, &documents))
+            .collect();
+        Ok(Json(ListResult { documents: dtos }))
+    }
+
+    /// Declares a symmetric Related edge between two existing Documents
+    /// (`crate::related::relate`), then runs the git pull/commit/push cycle
+    /// around the write, per `docs/ARCHITECTURE.md` ("Git mechanics"): every
+    /// mutating operation, including `relate`, goes through it.
+    #[tool(description = "Declare a symmetric Related edge between the Documents \
+        identified by `id_a` and `id_b`. Distinct from an outgoing hyperlink \
+        discovered in a Document's content: Related is a deliberate connection, \
+        declared explicitly rather than discovered by extraction. A no-op if the \
+        edge already exists.")]
+    async fn relate(
+        &self,
+        Parameters(params): Parameters<RelateParams>,
+    ) -> Result<Json<RelateResult>, ErrorData> {
+        let message = format!("relate: {} <-> {}", params.id_a, params.id_b);
+        let sync_dir = self.data_repo_path.clone();
+        let relate_dir = self.data_repo_path.clone();
+        let id_a = params.id_a.clone();
+        let id_b = params.id_b.clone();
+
+        tokio::task::spawn_blocking(move || {
+            git_sync::sync_write(&sync_dir, &message, move || related::relate(&relate_dir, &id_a, &id_b))
+        })
+        .await
+        .map_err(|error| ErrorData::internal_error(format!("relate task panicked: {error}"), None))?
+        .map_err(|error| relate_sync_error_to_mcp_error(&error))?;
+
+        Ok(Json(self.relate_result(&params.id_a, &params.id_b)?))
+    }
+
+    /// Removes the symmetric Related edge between two existing Documents
+    /// (`crate::related::unrelate`), then runs the git pull/commit/push
+    /// cycle around the write, per `docs/ARCHITECTURE.md` ("Git
+    /// mechanics").
+    #[tool(description = "Remove the symmetric Related edge between the Documents \
+        identified by `id_a` and `id_b`, if one exists. A no-op if no edge exists.")]
+    async fn unrelate(
+        &self,
+        Parameters(params): Parameters<RelateParams>,
+    ) -> Result<Json<RelateResult>, ErrorData> {
+        let message = format!("unrelate: {} <-> {}", params.id_a, params.id_b);
+        let sync_dir = self.data_repo_path.clone();
+        let unrelate_dir = self.data_repo_path.clone();
+        let id_a = params.id_a.clone();
+        let id_b = params.id_b.clone();
+
+        tokio::task::spawn_blocking(move || {
+            git_sync::sync_write(&sync_dir, &message, move || {
+                related::unrelate(&unrelate_dir, &id_a, &id_b)
+            })
+        })
+        .await
+        .map_err(|error| ErrorData::internal_error(format!("unrelate task panicked: {error}"), None))?
+        .map_err(|error| relate_sync_error_to_mcp_error(&error))?;
+
+        Ok(Json(self.relate_result(&params.id_a, &params.id_b)?))
+    }
+
+    /// Deletes a Document (`crate::delete::delete`), then runs the git
+    /// pull/commit/push cycle around the removal, per
+    /// `docs/ARCHITECTURE.md` ("Git mechanics", `delete`): "goes through
+    /// the same git pull/commit/push cycle; nothing is truly unrecoverable
+    /// since it's still in git history."
+    #[tool(description = "Delete a Document, identified by exactly one of `id`, `slug`, \
+        or `url`. The deletion is committed and pushed like any other write, so the \
+        Document remains recoverable from the data repo's git history even though it's \
+        gone from current state. Returns the Document as it stood just before deletion.")]
+    async fn delete(
+        &self,
+        Parameters(params): Parameters<DeleteParams>,
+    ) -> Result<Json<DocumentDto>, ErrorData> {
+        let identifier = store::identifier(params.id, params.slug, params.url)
+            .map_err(identifier_error_to_mcp_error)?;
+        let message = format!("delete: {identifier:?}");
+        let sync_dir = self.data_repo_path.clone();
+        let delete_dir = self.data_repo_path.clone();
+
+        let deleted = tokio::task::spawn_blocking(move || {
+            git_sync::sync_write(&sync_dir, &message, move || {
+                crate::delete::delete(&delete_dir, &identifier)
+            })
+        })
+        .await
+        .map_err(|error| ErrorData::internal_error(format!("delete task panicked: {error}"), None))?
+        .map_err(|error| delete_sync_error_to_mcp_error(&error))?;
+
+        let documents =
+            store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let related = resolve_related_refs(&documents, &deleted.related);
+        Ok(Json(DocumentDto::from_document(deleted, related)))
+    }
 }
 
 impl HusmoServer {
@@ -508,6 +661,26 @@ impl HusmoServer {
             match_count: hit.match_count,
         }
     }
+
+    /// Builds a `relate`/`unrelate` tool's result by reloading the two
+    /// Documents `id_a` and `id_b` identify after the edge was
+    /// declared/removed. Reloads from disk (rather than trusting the
+    /// values passed into the call) so the result always reflects what was
+    /// actually committed.
+    fn relate_result(&self, id_a: &str, id_b: &str) -> Result<RelateResult, ErrorData> {
+        let documents =
+            store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let find = |id: &str| {
+            documents
+                .iter()
+                .find(|document| document.id == id)
+                .cloned()
+                .ok_or_else(|| ErrorData::internal_error(format!("no Document found with id {id:?} after relate/unrelate"), None))
+        };
+        let document_a = Self::document_to_dto(find(id_a)?, &documents);
+        let document_b = Self::document_to_dto(find(id_b)?, &documents);
+        Ok(RelateResult { document_a, document_b })
+    }
 }
 
 /// The git commit message for a `save` call, describing what was saved.
@@ -523,6 +696,33 @@ fn commit_message(input: &SaveInput) -> String {
 /// MCP error reported back to the client.
 fn sync_error_to_mcp_error(error: &SyncError<SaveError>) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
+}
+
+/// Maps a failure from the `relate`/`unrelate` tools' git pull/commit/push
+/// cycle to the MCP error reported back to the client. A
+/// [`RelateError::NotFound`] or [`RelateError::SameDocument`] is a client
+/// input mistake, not a server-side failure, so it's reported as an
+/// invalid-params error rather than an internal one.
+fn relate_sync_error_to_mcp_error(error: &SyncError<RelateError>) -> ErrorData {
+    match error {
+        SyncError::Write(RelateError::NotFound(_) | RelateError::SameDocument(_)) => {
+            ErrorData::invalid_params(error.to_string(), None)
+        }
+        other => ErrorData::internal_error(other.to_string(), None),
+    }
+}
+
+/// Maps a failure from the `delete` tool's git pull/commit/push cycle to
+/// the MCP error reported back to the client. A [`DeleteError::NotFound`]
+/// is reported as a not-found error, matching `get`'s
+/// [`resolve_error_to_mcp_error`].
+fn delete_sync_error_to_mcp_error(error: &SyncError<DeleteError>) -> ErrorData {
+    match error {
+        SyncError::Write(DeleteError::NotFound(identifier)) => {
+            ErrorData::resource_not_found(format!("no Document found matching {identifier:?}"), None)
+        }
+        other => ErrorData::internal_error(other.to_string(), None),
+    }
 }
 
 /// Maps a failure from validating the `get` tool's `id`/`slug`/`url`
@@ -1225,5 +1425,147 @@ mod tests {
                 "expected tool {expected:?} to be registered, got {names:?}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_tool_returns_every_document() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let one = crate::document::Document::new("One", "first");
+        let two = crate::document::Document::new("Two", "second");
+        crate::store::write(dir.path(), &one).expect("write should succeed");
+        crate::store::write(dir.path(), &two).expect("write should succeed");
+
+        let structured = call_tool(dir.path().to_path_buf(), "list", serde_json::json!({}))
+            .await
+            .expect("list tool call should succeed")
+            .structured_content
+            .expect("list tool should return structured content");
+
+        let documents = structured["documents"].as_array().expect("documents should be an array");
+        assert_eq!(documents.len(), 2);
+        let ids: std::collections::HashSet<String> = documents
+            .iter()
+            .map(|doc| doc["id"].as_str().expect("id should be a string").to_string())
+            .collect();
+        assert_eq!(ids, std::collections::HashSet::from([one.id.clone(), two.id.clone()]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relate_tool_declares_a_symmetric_edge_end_to_end() {
+        let (_remote_dir, _local_dir, data_repo_path) = seeded_data_repo();
+        let doc_a = crate::document::Document::new("A", "content a");
+        let doc_b = crate::document::Document::new("B", "content b");
+        crate::store::write(&data_repo_path, &doc_a).expect("write should succeed");
+        crate::store::write(&data_repo_path, &doc_b).expect("write should succeed");
+
+        let structured = call_tool(
+            data_repo_path.clone(),
+            "relate",
+            serde_json::json!({ "id_a": doc_a.id, "id_b": doc_b.id }),
+        )
+        .await
+        .expect("relate tool call should succeed")
+        .structured_content
+        .expect("relate tool should return structured content");
+
+        assert_eq!(structured["document_a"]["id"], doc_a.id);
+        assert_eq!(structured["document_b"]["id"], doc_b.id);
+
+        let reloaded_a = crate::store::resolve(&data_repo_path, &crate::store::Identifier::Id(doc_a.id.clone()))
+            .expect("resolve should succeed");
+        let reloaded_b = crate::store::resolve(&data_repo_path, &crate::store::Identifier::Id(doc_b.id.clone()))
+            .expect("resolve should succeed");
+        assert_eq!(reloaded_a.related, vec![doc_b.id.clone()]);
+        assert_eq!(reloaded_b.related, vec![doc_a.id.clone()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unrelate_tool_removes_the_edge_end_to_end() {
+        let (_remote_dir, _local_dir, data_repo_path) = seeded_data_repo();
+        let doc_a = crate::document::Document::new("A", "content a");
+        let doc_b = crate::document::Document::new("B", "content b");
+        crate::store::write(&data_repo_path, &doc_a).expect("write should succeed");
+        crate::store::write(&data_repo_path, &doc_b).expect("write should succeed");
+        crate::related::relate(&data_repo_path, &doc_a.id, &doc_b.id).expect("relate should succeed");
+
+        let structured = call_tool(
+            data_repo_path.clone(),
+            "unrelate",
+            serde_json::json!({ "id_a": doc_a.id, "id_b": doc_b.id }),
+        )
+        .await
+        .expect("unrelate tool call should succeed")
+        .structured_content
+        .expect("unrelate tool should return structured content");
+
+        assert_eq!(structured["document_a"]["related"], serde_json::json!([]));
+        assert_eq!(structured["document_b"]["related"], serde_json::json!([]));
+
+        let reloaded_a = crate::store::resolve(&data_repo_path, &crate::store::Identifier::Id(doc_a.id.clone()))
+            .expect("resolve should succeed");
+        assert!(reloaded_a.related.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_tool_removes_a_document_and_survives_in_git_history() {
+        let (_remote_dir, _local_dir, data_repo_path) = seeded_data_repo();
+        let doc = crate::document::Document::new("My Title", "content\n");
+        crate::store::write(&data_repo_path, &doc).expect("write should succeed");
+        // Committed up front, the same way a prior `save` call would have
+        // left it — otherwise there is nothing in HEAD for the delete to
+        // actually remove, and `sync_write` correctly makes no commit.
+        let repo = git2::Repository::open(&data_repo_path).expect("failed to open repo");
+        commit_all(&repo, "save: My Title");
+
+        let structured = call_tool(
+            data_repo_path.clone(),
+            "delete",
+            serde_json::json!({ "id": doc.id }),
+        )
+        .await
+        .expect("delete tool call should succeed")
+        .structured_content
+        .expect("delete tool should return structured content");
+
+        assert_eq!(structured["id"], doc.id);
+        let on_disk = crate::store::load_all(&data_repo_path).expect("load_all should succeed");
+        assert!(
+            on_disk.is_empty(),
+            "the document should no longer be present in the data repo's current state"
+        );
+
+        let repo = git2::Repository::open(&data_repo_path).expect("failed to open repo");
+        let mut revwalk = repo.revwalk().expect("failed to create revwalk");
+        revwalk.push_head().expect("failed to push HEAD");
+        let messages: Vec<String> = revwalk
+            .map(|oid| {
+                repo.find_commit(oid.expect("revwalk should yield a valid oid"))
+                    .expect("oid should resolve to a commit")
+                    .message()
+                    .expect("commit message should be utf8")
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            messages.iter().any(|message| message.contains(&doc.id) || message.to_lowercase().contains("delete")),
+            "expected a commit describing the deletion, got {messages:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_tool_reports_a_not_found_error_for_an_unknown_identifier() {
+        let (_remote_dir, _local_dir, data_repo_path) = seeded_data_repo();
+
+        let result = call_tool(
+            data_repo_path,
+            "delete",
+            serde_json::json!({ "id": "nonexistent-id" }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "calling delete with an identifier matching no Document should fail, got {result:?}"
+        );
     }
 }

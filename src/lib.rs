@@ -7,6 +7,7 @@
 pub mod archive;
 pub mod chunk;
 pub mod config;
+pub mod delete;
 pub mod document;
 pub mod embed;
 pub mod embeddings;

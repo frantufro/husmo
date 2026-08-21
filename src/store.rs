@@ -36,6 +36,15 @@ pub enum StoreError {
         #[source]
         source: std::io::Error,
     },
+    /// A file could not be removed.
+    #[error("failed to remove {}", path.display())]
+    Remove {
+        /// The path that was removed.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// A directory could not be listed.
     #[error("failed to list directory {}", path.display())]
     ListDir {
@@ -69,6 +78,17 @@ pub fn write(dir: &Path, doc: &Document) -> Result<PathBuf, StoreError> {
         source,
     })?;
     Ok(path)
+}
+
+/// Removes `slug`'s Document file (`{slug}.md`) from `dir`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Remove`] if the file can't be removed, including
+/// if it doesn't exist.
+pub fn remove(dir: &Path, slug: &str) -> Result<(), StoreError> {
+    let path = dir.join(format!("{slug}.{EXTENSION}"));
+    std::fs::remove_file(&path).map_err(|source| StoreError::Remove { path, source })
 }
 
 /// Reads and parses the Document file at `path`.
@@ -349,6 +369,27 @@ mod tests {
         loaded.sort_by(|a, b| a.slug.cmp(&b.slug));
 
         assert_eq!(loaded, vec![one, two]);
+    }
+
+    #[test]
+    fn remove_deletes_a_documents_file() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let doc = Document::new("My Title", "content\n");
+        let path = write(dir.path(), &doc).expect("write should succeed");
+        assert!(path.is_file());
+
+        remove(dir.path(), &doc.slug).expect("remove should succeed");
+
+        assert!(!path.is_file());
+    }
+
+    #[test]
+    fn remove_errors_when_the_file_does_not_exist() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let result = remove(dir.path(), "does-not-exist");
+
+        assert!(matches!(result, Err(StoreError::Remove { .. })));
     }
 
     #[test]

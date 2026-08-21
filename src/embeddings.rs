@@ -117,6 +117,15 @@ pub enum EmbeddingsError {
         #[source]
         source: serde_norway::Error,
     },
+    /// The sidecar file could not be removed.
+    #[error("failed to remove {}", path.display())]
+    Remove {
+        /// The path that was removed.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// A directory could not be listed.
     #[error("failed to list directory {}", path.display())]
     ListDir {
@@ -155,6 +164,24 @@ pub fn write(
         source,
     })?;
     Ok(path)
+}
+
+/// Removes `slug`'s sidecar file from `dir`, if one exists. A no-op, not an
+/// error, when no sidecar file exists for `slug` — not every Document
+/// necessarily has one (e.g. one written directly rather than through
+/// `crate::save`).
+///
+/// # Errors
+///
+/// Returns [`EmbeddingsError::Remove`] if the file exists but can't be
+/// removed.
+pub fn remove(dir: &Path, slug: &str) -> Result<(), EmbeddingsError> {
+    let path = sidecar_path(dir, slug);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(EmbeddingsError::Remove { path, source }),
+    }
 }
 
 /// Reads and parses the sidecar file at `path`.
@@ -267,6 +294,26 @@ mod tests {
 
         assert_eq!(loaded, embeddings);
         assert_eq!(path, dir.path().join("my-title.embeddings.yaml"));
+    }
+
+    #[test]
+    fn remove_deletes_a_sidecar_file() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let document = Document::new("My Title", "content\n");
+        let embeddings = DocumentEmbeddings::build(&document).expect("build should succeed");
+        let path = write(dir.path(), &document.slug, &embeddings).expect("write should succeed");
+        assert!(path.is_file());
+
+        remove(dir.path(), &document.slug).expect("remove should succeed");
+
+        assert!(!path.is_file());
+    }
+
+    #[test]
+    fn remove_is_a_no_op_when_no_sidecar_file_exists() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        remove(dir.path(), "does-not-exist").expect("remove should succeed even with no sidecar file");
     }
 
     #[test]
