@@ -35,12 +35,13 @@ pub(crate) enum UrlIngestError {
 }
 
 /// Fetches `url`, extracts it to Markdown, downloads and localizes its
-/// images, and builds the resulting Document — reusing the `id`/`slug` of
-/// an existing Document for the same `canonical_url` in `dir`, if any, so
-/// the caller overwrites it in place instead of creating a second one, per
-/// `docs/ARCHITECTURE.md` ("Storage model"). The Document's title comes
-/// from the fetched page's `<title>`, falling back to `fallback_title` when
-/// the page has none.
+/// images, and builds the resulting Document — reusing the `id`/`slug`/
+/// `related` of an existing Document for the same `canonical_url` in `dir`,
+/// if any, so the caller overwrites it in place instead of creating a
+/// second one, per `docs/ARCHITECTURE.md` ("Storage model"), without
+/// losing that Document's `related` edges to a plain re-fetch. The
+/// Document's title comes from the fetched page's `<title>`, falling back
+/// to `fallback_title` when the page has none.
 ///
 /// Writes nothing to disk — the caller decides when/whether to
 /// `crate::store::write` the result (and whether to wrap that in
@@ -70,9 +71,13 @@ pub(crate) fn fetch_and_build_document(
         Ok(existing) => {
             // A Document for this canonical_url already exists — overwrite
             // it in place by reusing its id and slug, rather than creating
-            // a second Document for the same URL.
+            // a second Document for the same URL. Its `related` edges are
+            // deliberate, symmetric links to other Documents (set via the
+            // `relate`/`unrelate` tools, not derived from this page's own
+            // content), so they carry over untouched by a re-fetch.
             document.id = existing.id;
             document.slug = existing.slug;
+            document.related = existing.related;
         }
         Err(store::ResolveError::NotFound(_)) => {
             document.slug = dedupe_slug(&document.slug, &store::existing_slugs(dir)?);

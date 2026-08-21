@@ -460,4 +460,42 @@ mod tests {
             "re-saving the same url should not create a second Document"
         );
     }
+
+    #[test]
+    fn save_preserves_related_edges_when_the_same_url_is_saved_again() {
+        let url = two_shot_page_server(
+            "<html><head><title>Original Title</title></head>\
+             <body><article><p>Original content.</p></article></body></html>",
+            "<html><head><title>Original Title</title></head>\
+             <body><article><p>Updated content.</p></article></body></html>",
+        );
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let first = save(dir.path(), SaveInput::Url(url.clone()), Vec::new())
+            .expect("first save should succeed");
+        let other = Document::new("Other Document", "other content");
+        crate::store::write(dir.path(), &other).expect("write should succeed");
+        crate::related::relate(dir.path(), &first.document.id, &other.id)
+            .expect("relate should succeed");
+
+        let second = save(dir.path(), SaveInput::Url(url), Vec::new())
+            .expect("second save should succeed");
+
+        assert_eq!(
+            second.document.related,
+            vec![other.id.clone()],
+            "re-saving the same url should not wipe the Document's related edges"
+        );
+
+        let reloaded_other = crate::store::resolve(
+            dir.path(),
+            &crate::store::Identifier::Id(other.id.clone()),
+        )
+        .expect("resolve should succeed");
+        assert_eq!(
+            reloaded_other.related,
+            vec![second.document.id.clone()],
+            "the other side of the relation should be unaffected"
+        );
+    }
 }
