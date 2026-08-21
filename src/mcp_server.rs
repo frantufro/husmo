@@ -542,20 +542,10 @@ impl HusmoServer {
         &self,
         Parameters(params): Parameters<RelateParams>,
     ) -> Result<Json<RelateResult>, ErrorData> {
-        let message = format!("relate: {} <-> {}", params.id_a, params.id_b);
-        let sync_dir = self.data_repo_path.clone();
-        let relate_dir = self.data_repo_path.clone();
-        let id_a = params.id_a.clone();
-        let id_b = params.id_b.clone();
-
-        tokio::task::spawn_blocking(move || {
-            git_sync::sync_write(&sync_dir, &message, move || related::relate(&relate_dir, &id_a, &id_b))
-        })
-        .await
-        .map_err(|error| ErrorData::internal_error(format!("relate task panicked: {error}"), None))?
-        .map_err(|error| relate_sync_error_to_mcp_error(&error))?;
-
-        Ok(Json(self.relate_result(&params.id_a, &params.id_b)?))
+        Ok(Json(
+            self.relate_or_unrelate("relate", params.id_a, params.id_b, related::relate)
+                .await?,
+        ))
     }
 
     /// Removes the symmetric Related edge between two existing Documents
@@ -568,22 +558,10 @@ impl HusmoServer {
         &self,
         Parameters(params): Parameters<RelateParams>,
     ) -> Result<Json<RelateResult>, ErrorData> {
-        let message = format!("unrelate: {} <-> {}", params.id_a, params.id_b);
-        let sync_dir = self.data_repo_path.clone();
-        let unrelate_dir = self.data_repo_path.clone();
-        let id_a = params.id_a.clone();
-        let id_b = params.id_b.clone();
-
-        tokio::task::spawn_blocking(move || {
-            git_sync::sync_write(&sync_dir, &message, move || {
-                related::unrelate(&unrelate_dir, &id_a, &id_b)
-            })
-        })
-        .await
-        .map_err(|error| ErrorData::internal_error(format!("unrelate task panicked: {error}"), None))?
-        .map_err(|error| relate_sync_error_to_mcp_error(&error))?;
-
-        Ok(Json(self.relate_result(&params.id_a, &params.id_b)?))
+        Ok(Json(
+            self.relate_or_unrelate("unrelate", params.id_a, params.id_b, related::unrelate)
+                .await?,
+        ))
     }
 
     /// Deletes a Document (`crate::delete::delete`), then runs the git
@@ -662,6 +640,47 @@ impl HusmoServer {
         }
     }
 
+    /// Runs the git pull/commit/push cycle around a `relate`/`unrelate`
+    /// write, factoring out the `spawn_blocking`/`git_sync::sync_write`
+    /// wiring the two tools would otherwise duplicate — they differ only
+    /// in the commit message's verb and which `crate::related` function
+    /// performs the write, passed as `write`.
+    ///
+    /// Rejects `id_a == id_b` up front, before the git repo is even opened,
+    /// the same way `save` validates its params before touching git: that
+    /// check is purely client-side (per [`RelateError::SameDocument`]), so
+    /// there's no reason to pay for a pull from the remote only to have the
+    /// write closure reject the call afterwards.
+    async fn relate_or_unrelate(
+        &self,
+        verb: &'static str,
+        id_a: String,
+        id_b: String,
+        write: fn(&std::path::Path, &str, &str) -> Result<(), RelateError>,
+    ) -> Result<RelateResult, ErrorData> {
+        if id_a == id_b {
+            return Err(ErrorData::invalid_params(
+                RelateError::SameDocument(id_a).to_string(),
+                None,
+            ));
+        }
+
+        let message = format!("{verb}: {id_a} <-> {id_b}");
+        let sync_dir = self.data_repo_path.clone();
+        let write_dir = self.data_repo_path.clone();
+        let write_id_a = id_a.clone();
+        let write_id_b = id_b.clone();
+
+        tokio::task::spawn_blocking(move || {
+            git_sync::sync_write(&sync_dir, &message, move || write(&write_dir, &write_id_a, &write_id_b))
+        })
+        .await
+        .map_err(|error| ErrorData::internal_error(format!("{verb} task panicked: {error}"), None))?
+        .map_err(|error| relate_sync_error_to_mcp_error(&error))?;
+
+        self.relate_result(&id_a, &id_b)
+    }
+
     /// Builds a `relate`/`unrelate` tool's result by reloading the two
     /// Documents `id_a` and `id_b` identify after the edge was
     /// declared/removed. Reloads from disk (rather than trusting the
@@ -700,13 +719,19 @@ fn sync_error_to_mcp_error(error: &SyncError<SaveError>) -> ErrorData {
 
 /// Maps a failure from the `relate`/`unrelate` tools' git pull/commit/push
 /// cycle to the MCP error reported back to the client. A
-/// [`RelateError::NotFound`] or [`RelateError::SameDocument`] is a client
-/// input mistake, not a server-side failure, so it's reported as an
-/// invalid-params error rather than an internal one.
+/// [`RelateError::SameDocument`] is a malformed call (`id_a` and `id_b` are
+/// the same id), reported as an invalid-params error; a
+/// [`RelateError::NotFound`] means one of the ids simply doesn't resolve to
+/// a Document, the same "no such Document" situation `get` and `delete`
+/// report via [`resolve_error_to_mcp_error`]/[`delete_sync_error_to_mcp_error`],
+/// so it's reported as a not-found error to match.
 fn relate_sync_error_to_mcp_error(error: &SyncError<RelateError>) -> ErrorData {
     match error {
-        SyncError::Write(RelateError::NotFound(_) | RelateError::SameDocument(_)) => {
+        SyncError::Write(RelateError::SameDocument(_)) => {
             ErrorData::invalid_params(error.to_string(), None)
+        }
+        SyncError::Write(RelateError::NotFound(_)) => {
+            ErrorData::resource_not_found(error.to_string(), None)
         }
         other => ErrorData::internal_error(other.to_string(), None),
     }
@@ -1477,6 +1502,70 @@ mod tests {
             .expect("resolve should succeed");
         assert_eq!(reloaded_a.related, vec![doc_b.id.clone()]);
         assert_eq!(reloaded_b.related, vec![doc_a.id.clone()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relate_tool_rejects_the_same_id_twice_before_touching_git() {
+        // A plain directory, not a git repository at all: if `relate`
+        // validated `id_a != id_b` only inside the git pull/commit/push
+        // cycle (as `crate::related::relate` itself does), this call would
+        // fail with a git "failed to open repository" error instead of the
+        // client-input error being asserted on below.
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let result = call_tool(
+            dir.path().to_path_buf(),
+            "relate",
+            serde_json::json!({ "id_a": "same-id", "id_b": "same-id" }),
+        )
+        .await;
+
+        let error = result.expect_err("relating a Document to itself should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot relate a Document to itself"),
+            "expected a same-document validation error, got {message:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unrelate_tool_rejects_the_same_id_twice_before_touching_git() {
+        // See `relate_tool_rejects_the_same_id_twice_before_touching_git`:
+        // same reasoning, for `unrelate`.
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let result = call_tool(
+            dir.path().to_path_buf(),
+            "unrelate",
+            serde_json::json!({ "id_a": "same-id", "id_b": "same-id" }),
+        )
+        .await;
+
+        let error = result.expect_err("unrelating a Document from itself should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot relate a Document to itself"),
+            "expected a same-document validation error, got {message:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relate_tool_reports_a_not_found_error_for_an_unknown_id() {
+        let (_remote_dir, _local_dir, data_repo_path) = seeded_data_repo();
+        let doc_a = crate::document::Document::new("A", "content a");
+        crate::store::write(&data_repo_path, &doc_a).expect("write should succeed");
+
+        let result = call_tool(
+            data_repo_path,
+            "relate",
+            serde_json::json!({ "id_a": doc_a.id, "id_b": "nonexistent-id" }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "relating to an id matching no Document should fail, got {result:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
