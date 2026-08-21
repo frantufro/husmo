@@ -84,20 +84,20 @@ Four distinct capabilities — do not collapse into one fuzzy "search":
 - Documents are split into chunks (paragraph/section-sized) before
   embedding — not embedded as one whole-document vector. Better recall
   against long content.
-- Embeddings are generated **locally, in-process**, with zero network
-  calls and no external embeddings API. This is a deliberate project
-  value — see ADR 0001, and state it in the README.
-- The current implementation (`src/embed.rs`) is a deterministic
-  feature-hashing bag-of-words vector: each token is hashed into a fixed
-  slot with a sign, slots are accumulated, and the result is
-  L2-normalized. It stays small and dependency-free, and its cosine
-  similarity reflects shared vocabulary well. A trained local model (e.g.
-  via `candle`) would generalize further, to synonyms and paraphrase. The
+- Embeddings are generated **locally, in-process, via a real trained
+  model** (`candle` + a small pre-trained sentence-embedding model, e.g.
+  `all-MiniLM-L6-v2`). This is a deliberate project value — see ADR 0001
+  — and state it in the README. The constraint is zero network calls
+  *per operation* (no save/search ever calls out to an API); fetching the
+  model's weights once, at setup/first-run, and caching them locally
+  after that, is within that constraint and does not violate it.
+- An earlier revision of this file described a deterministic
+  feature-hashing bag-of-words placeholder in place of the trained model,
+  reasoning that even a one-time weights download broke "zero network
+  calls." That reasoning was rejected — that implementation is being
+  replaced with the real model it should have used from the start. The
   sidecar file format is agnostic to which function produced the vectors,
-  so upgrading the embedding function later is a drop-in change; a
-  semantic-search implementation built on today's vectors should expect
-  results closer to vocabulary overlap than to true semantic
-  generalization.
+  so this is a drop-in replacement, not a format change.
 - Each Document's chunk embeddings are committed to the data repo as small
   per-Document sidecar files — not one giant shared blob.
 - The assembled searchable vector index (e.g. `usearch` or a pure-Rust HNSW
@@ -137,6 +137,28 @@ don't conflate the two.
   - `list`
   - `delete` — goes through the same git pull/commit/push cycle; nothing is
     truly unrecoverable since it's still in git history.
+
+## MCP resources
+
+Alongside the tool surface above, husmo exposes Documents as MCP resources
+(`resources/list` + `resources/read`) — a second, additional interface, not
+a replacement for `list`/`get`. Tools serve an agent deciding mid-task to
+retrieve something; resources serve a human directly `@`-attaching a
+Document they already know they want, in clients that support it (e.g.
+Claude Code). Both interfaces share the same underlying Store code. See
+`docs/adr/0002-mcp-resources-alongside-tools-for-document-browsing.md`.
+
+- A resource's URI identifies a Document by `slug` (human-derived,
+  fuzzy-searchable via the client's picker). Retitling a Document changes
+  its slug and can break an old `@` reference — accepted, not guarded
+  against with alias tracking.
+- `resources/read` returns the same shape as `get`: raw on-disk
+  Markdown-with-frontmatter (`text/markdown`), Related Documents listed by
+  reference only, never inlined.
+- A resource's `name` is the Document's `title`; `description` is
+  `summary` when present, else a short `content` snippet.
+- `resources/list` is paginated from the start (cursor-based), even though
+  current scale doesn't require it.
 
 ## Explicit non-goals (for now)
 
