@@ -7,8 +7,8 @@
 //! of those modules leaves to its caller: the git pull/commit/push cycle
 //! (`crate::git_sync::sync_write`).
 //!
-//! Only the `save` tool is implemented here. The rest of the tool surface
-//! (`get`, `search-*`, `relate`/`unrelate`, `list`, `delete`) is added by
+//! The `save` and `get` tools are implemented here. The rest of the tool
+//! surface (`search-*`, `relate`/`unrelate`, `list`, `delete`) is added by
 //! later roadmap tasks onto this same [`HusmoServer`].
 
 use std::path::PathBuf;
@@ -23,6 +23,7 @@ use crate::document::Document;
 use crate::extract::OutgoingLink;
 use crate::git_sync::{self, SyncError};
 use crate::save::{self, SaveError, SaveInput};
+use crate::store::{self, IdentifierError, ResolveError};
 
 /// The husmo MCP server: holds the data repo path every tool operates
 /// against. Constructed once per session and served over stdio (see
@@ -116,6 +117,24 @@ impl From<Document> for DocumentDto {
     }
 }
 
+/// Parameters for the `get` tool. Exactly one of `id`/`slug`/`url` is
+/// required, validated server-side by [`crate::store::identifier`].
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetParams {
+    /// The Document's stable internal id. Exactly one of `id`, `slug`, or
+    /// `url` is required.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The Document's slug. Exactly one of `id`, `slug`, or `url` is
+    /// required.
+    #[serde(default)]
+    pub slug: Option<String>,
+    /// The Document's canonical URL. Exactly one of `id`, `slug`, or `url`
+    /// is required.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
 /// The wire shape of an outgoing link discovered during extraction. Mirrors
 /// [`crate::extract::OutgoingLink`].
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -193,6 +212,25 @@ impl HusmoServer {
             outgoing_links: output.outgoing_links.into_iter().map(Into::into).collect(),
         }))
     }
+
+    /// Looks up exactly one Document by `id`, `slug`, or `url`
+    /// (`crate::store::identifier` validates that exactly one was supplied,
+    /// `crate::store::resolve` finds it), including its Related list by
+    /// reference. Unlike `save`, this is a pure local read with no network
+    /// I/O and no git pull/commit/push cycle, so it runs directly rather
+    /// than on the blocking thread pool.
+    #[tool(
+        description = "Look up a Document by exactly one of `id`, `slug`, or `url`. Returns \
+            the Document, including its Related list by reference (ids only; use `search-*` \
+            with expansion to pull in their content)."
+    )]
+    async fn get(&self, Parameters(params): Parameters<GetParams>) -> Result<Json<DocumentDto>, ErrorData> {
+        let identifier = store::identifier(params.id, params.slug, params.url)
+            .map_err(identifier_error_to_mcp_error)?;
+        let document = store::resolve(&self.data_repo_path, &identifier)
+            .map_err(|error| resolve_error_to_mcp_error(&error))?;
+        Ok(Json(document.into()))
+    }
 }
 
 /// The git commit message for a `save` call, describing what was saved.
@@ -208,6 +246,21 @@ fn commit_message(input: &SaveInput) -> String {
 /// MCP error reported back to the client.
 fn sync_error_to_mcp_error(error: &SyncError<SaveError>) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
+}
+
+/// Maps a failure from validating the `get` tool's `id`/`slug`/`url`
+/// parameters to the MCP error reported back to the client.
+fn identifier_error_to_mcp_error(error: IdentifierError) -> ErrorData {
+    ErrorData::invalid_params(error.to_string(), None)
+}
+
+/// Maps a failure from resolving the `get` tool's identifier to a Document
+/// to the MCP error reported back to the client.
+fn resolve_error_to_mcp_error(error: &ResolveError) -> ErrorData {
+    match error {
+        ResolveError::NotFound(_) => ErrorData::resource_not_found(error.to_string(), None),
+        ResolveError::Store(_) => ErrorData::internal_error(error.to_string(), None),
+    }
 }
 
 #[tool_handler(
@@ -519,6 +572,147 @@ mod tests {
         assert!(
             on_disk.is_empty(),
             "no Document should have been written for an invalid call"
+        );
+    }
+
+    /// Serves a fresh `HusmoServer` rooted at `data_repo_path` and calls its
+    /// `get` tool with `arguments`, over a real (in-memory) MCP
+    /// client/server connection. `get` is a read-only lookup, so unlike
+    /// [`call_save`] this needs only a plain directory, not a git-backed
+    /// data repo with a remote to push to.
+    async fn call_get(
+        data_repo_path: PathBuf,
+        arguments: serde_json::Value,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ServiceError> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+
+        let server = HusmoServer::new(data_repo_path);
+        let server_handle = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .expect("server should start")
+                .waiting()
+                .await
+                .expect("server should shut down cleanly");
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("client should connect");
+
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("get").with_arguments(
+                    arguments
+                        .as_object()
+                        .expect("arguments should be a JSON object")
+                        .clone(),
+                ),
+            )
+            .await;
+
+        client.cancel().await.expect("client should shut down cleanly");
+        server_handle.await.expect("server task should not panic");
+
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_tool_resolves_the_same_document_by_id_slug_or_url() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let mut doc = crate::document::Document::new("My Title", "Some content.\n");
+        doc.canonical_url = Some("https://example.com/post".to_string());
+        crate::store::write(dir.path(), &doc).expect("write should succeed");
+
+        let by_id = call_get(dir.path().to_path_buf(), serde_json::json!({ "id": doc.id }))
+            .await
+            .expect("get by id should succeed")
+            .structured_content
+            .expect("get tool should return structured content");
+        let by_slug = call_get(dir.path().to_path_buf(), serde_json::json!({ "slug": doc.slug }))
+            .await
+            .expect("get by slug should succeed")
+            .structured_content
+            .expect("get tool should return structured content");
+        let by_url = call_get(
+            dir.path().to_path_buf(),
+            serde_json::json!({ "url": "https://example.com/post" }),
+        )
+        .await
+        .expect("get by url should succeed")
+        .structured_content
+        .expect("get tool should return structured content");
+
+        for structured in [&by_id, &by_slug, &by_url] {
+            assert_eq!(structured["id"], doc.id);
+            assert_eq!(structured["title"], "My Title");
+            assert_eq!(structured["content"], "Some content.\n");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_tool_includes_the_related_list_by_reference() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let doc_a = crate::document::Document::new("A", "content a");
+        let doc_b = crate::document::Document::new("B", "content b");
+        crate::store::write(dir.path(), &doc_a).expect("write should succeed");
+        crate::store::write(dir.path(), &doc_b).expect("write should succeed");
+        crate::related::relate(dir.path(), &doc_a.id, &doc_b.id).expect("relate should succeed");
+
+        let structured = call_get(dir.path().to_path_buf(), serde_json::json!({ "id": doc_a.id }))
+            .await
+            .expect("get tool call should succeed")
+            .structured_content
+            .expect("get tool should return structured content");
+
+        assert_eq!(structured["related"], serde_json::json!([doc_b.id]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_tool_reports_a_validation_error_when_zero_identifiers_are_supplied() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let result = call_get(dir.path().to_path_buf(), serde_json::json!({})).await;
+
+        assert!(
+            result.is_err(),
+            "calling get with none of id/slug/url set should fail, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_tool_reports_a_validation_error_when_multiple_identifiers_are_supplied() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let doc = crate::document::Document::new("My Title", "content");
+        crate::store::write(dir.path(), &doc).expect("write should succeed");
+
+        let result = call_get(
+            dir.path().to_path_buf(),
+            serde_json::json!({ "id": doc.id, "slug": doc.slug }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "calling get with both id and slug set should fail, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_tool_reports_a_not_found_error_for_an_unknown_identifier() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let result = call_get(
+            dir.path().to_path_buf(),
+            serde_json::json!({ "slug": "does-not-exist" }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "calling get with an identifier matching no Document should fail, got {result:?}"
         );
     }
 }
