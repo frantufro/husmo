@@ -6,6 +6,7 @@
 //! this module.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::document::{Document, DocumentParseError};
@@ -199,6 +200,15 @@ pub enum ResolveError {
     Store(#[from] StoreError),
 }
 
+/// Reports whether `s` is safe to use as a single filename component: no
+/// path separators, and not a special component like `.` or `..`. Guards
+/// [`resolve`]'s slug lookup against a slug that would otherwise let a
+/// caller escape `dir` (e.g. `../../etc/passwd`) or resolve to a directory
+/// entry (e.g. `.`).
+fn is_bare_filename_component(s: &str) -> bool {
+    Path::new(s).file_name() == Some(OsStr::new(s))
+}
+
 /// Resolves `identifier` to the one Document in `dir` it refers to.
 ///
 /// # Errors
@@ -208,6 +218,9 @@ pub enum ResolveError {
 pub fn resolve(dir: &Path, identifier: &Identifier) -> Result<Document, ResolveError> {
     match identifier {
         Identifier::Slug(slug) => {
+            if !is_bare_filename_component(slug) {
+                return Err(ResolveError::NotFound(identifier.clone()));
+            }
             let path = dir.join(format!("{slug}.{EXTENSION}"));
             if path.is_file() {
                 Ok(read(&path)?)
@@ -259,6 +272,35 @@ mod tests {
         let result = resolve(dir.path(), &Identifier::Slug("nope".to_string()));
 
         assert!(matches!(result, Err(ResolveError::NotFound(_))));
+    }
+
+    #[test]
+    fn resolve_rejects_slugs_that_would_traverse_outside_the_directory() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let outside_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let secret = outside_dir.path().join("secret.md");
+        std::fs::write(&secret, "top secret").expect("failed to write outside file");
+
+        // A path-traversal slug reaching for the sibling temp dir's file.
+        let traversal = format!(
+            "../{}/secret",
+            outside_dir
+                .path()
+                .file_name()
+                .expect("temp dir should have a name")
+                .to_string_lossy()
+        );
+        let result = resolve(dir.path(), &Identifier::Slug(traversal));
+        assert!(matches!(result, Err(ResolveError::NotFound(_))));
+
+        // Bare separators and special components are rejected too.
+        for slug in ["a/b", "..", ".", "/etc/passwd"] {
+            let result = resolve(dir.path(), &Identifier::Slug(slug.to_string()));
+            assert!(
+                matches!(result, Err(ResolveError::NotFound(_))),
+                "expected slug {slug:?} to be rejected as not found"
+            );
+        }
     }
 
     #[test]
