@@ -15,4 +15,6 @@ pub mod git_sync;
 pub mod images;
 pub mod local_file;
 pub mod pasted_text;
+pub mod semantic_search;
 pub mod store;
+pub mod vector_index;

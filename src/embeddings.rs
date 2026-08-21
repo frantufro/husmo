@@ -116,6 +116,15 @@ pub enum EmbeddingsError {
         #[source]
         source: serde_norway::Error,
     },
+    /// A directory could not be listed.
+    #[error("failed to list directory {}", path.display())]
+    ListDir {
+        /// The directory that was listed.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// The path a sidecar file for `slug` would live at inside `dir`, e.g.
@@ -160,6 +169,38 @@ pub fn read(path: &Path) -> Result<DocumentEmbeddings, EmbeddingsError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Loads every chunk-embedding sidecar file (`*.{EXTENSION}`) directly
+/// inside `dir`, per `docs/ARCHITECTURE.md` ("Retrieval"): the in-process
+/// vector index is rebuilt at startup from these committed sidecar files.
+///
+/// # Errors
+///
+/// Returns [`EmbeddingsError::ListDir`] if `dir` can't be listed, or any
+/// error [`read`] can return for one of its entries.
+pub fn load_all(dir: &Path) -> Result<Vec<DocumentEmbeddings>, EmbeddingsError> {
+    let entries = std::fs::read_dir(dir).map_err(|source| EmbeddingsError::ListDir {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+
+    let mut sidecars = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| EmbeddingsError::ListDir {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let is_sidecar = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&format!(".{EXTENSION}")));
+        if is_sidecar {
+            sidecars.push(read(&path)?);
+        }
+    }
+    Ok(sidecars)
 }
 
 #[cfg(test)]
@@ -232,5 +273,23 @@ mod tests {
             sidecar_path(dir, "my-title"),
             Path::new("/data-repo/my-title.embeddings.yaml")
         );
+    }
+
+    #[test]
+    fn load_all_reads_every_sidecar_file_in_a_directory() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let one = DocumentEmbeddings::build(&Document::new("One", "First document."));
+        let two = DocumentEmbeddings::build(&Document::new("Two", "Second document."));
+        write(dir.path(), "one", &one).expect("write should succeed");
+        write(dir.path(), "two", &two).expect("write should succeed");
+        std::fs::write(dir.path().join("one.md"), "not a sidecar file")
+            .expect("failed to write stray file");
+
+        let mut loaded = load_all(dir.path()).expect("load_all should succeed");
+        loaded.sort_by(|a, b| a.document_id.cmp(&b.document_id));
+        let mut expected = vec![one, two];
+        expected.sort_by(|a, b| a.document_id.cmp(&b.document_id));
+
+        assert_eq!(loaded, expected);
     }
 }
