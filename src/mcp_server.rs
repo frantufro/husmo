@@ -142,16 +142,16 @@ pub struct RelatedRefDto {
 
 /// Resolves a Document's `related` ids to `(id, title)` references, per
 /// `docs/ARCHITECTURE.md` ("Related"), by looking each id up among the
-/// Documents in `dir`. A related id with no matching Document on disk
+/// already-loaded `documents`. A related id with no matching Document
 /// (e.g. the other side of the edge was deleted independently) is
 /// silently omitted rather than surfaced as an error.
 ///
-/// # Errors
-///
-/// Returns [`StoreError`] if `dir` can't be read.
-fn resolve_related_refs(dir: &std::path::Path, related_ids: &[String]) -> Result<Vec<RelatedRefDto>, StoreError> {
-    let documents = store::load_all(dir)?;
-    Ok(related_ids
+/// Takes an already-loaded Document list rather than a directory to read,
+/// so callers that already hold the full list (e.g. a `search-*` handler
+/// resolving Related refs for many hits) don't re-read and re-parse every
+/// Document file per hit.
+fn resolve_related_refs(documents: &[Document], related_ids: &[String]) -> Vec<RelatedRefDto> {
+    related_ids
         .iter()
         .filter_map(|id| {
             documents.iter().find(|doc| doc.id == *id).map(|doc| RelatedRefDto {
@@ -159,7 +159,7 @@ fn resolve_related_refs(dir: &std::path::Path, related_ids: &[String]) -> Result
                 title: doc.title.clone(),
             })
         })
-        .collect())
+        .collect()
 }
 
 /// Parameters for the `get` tool. Exactly one of `id`/`slug`/`url` is
@@ -342,8 +342,9 @@ impl HusmoServer {
         .map_err(|error| ErrorData::internal_error(format!("save task panicked: {error}"), None))?
         .map_err(|error| sync_error_to_mcp_error(&error))?;
 
-        let related = resolve_related_refs(&self.data_repo_path, &output.document.related)
-            .map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents =
+            store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let related = resolve_related_refs(&documents, &output.document.related);
         Ok(Json(SaveResult {
             document: DocumentDto::from_document(output.document, related),
             outgoing_links: output.outgoing_links.into_iter().map(Into::into).collect(),
@@ -366,8 +367,9 @@ impl HusmoServer {
             .map_err(identifier_error_to_mcp_error)?;
         let document = store::resolve(&self.data_repo_path, &identifier)
             .map_err(|error| resolve_error_to_mcp_error(&error))?;
-        let related = resolve_related_refs(&self.data_repo_path, &document.related)
-            .map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents =
+            store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let related = resolve_related_refs(&documents, &document.related);
         Ok(Json(DocumentDto::from_document(document, related)))
     }
 
@@ -406,8 +408,8 @@ impl HusmoServer {
 
         let hits = hits
             .into_iter()
-            .map(|hit| self.semantic_hit_to_dto(hit))
-            .collect::<Result<Vec<_>, ErrorData>>()?;
+            .map(|hit| Self::semantic_hit_to_dto(hit, &documents))
+            .collect();
         Ok(Json(SearchSemanticResult { hits }))
     }
 
@@ -428,11 +430,13 @@ impl HusmoServer {
         let documents = store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
         let hits = tag_search::tag_search(&documents, &params.tag);
 
-        let documents = hits
+        let result_documents = hits
             .into_iter()
-            .map(|document| self.document_to_dto(document))
-            .collect::<Result<Vec<_>, ErrorData>>()?;
-        Ok(Json(SearchTagResult { documents }))
+            .map(|document| Self::document_to_dto(document, &documents))
+            .collect();
+        Ok(Json(SearchTagResult {
+            documents: result_documents,
+        }))
     }
 
     /// Full-text/keyword search, per `docs/ARCHITECTURE.md` ("Retrieval",
@@ -458,45 +462,51 @@ impl HusmoServer {
 
         let hits = hits
             .into_iter()
-            .map(|hit| self.fulltext_hit_to_dto(hit))
-            .collect::<Result<Vec<_>, ErrorData>>()?;
+            .map(|hit| Self::fulltext_hit_to_dto(hit, &documents))
+            .collect();
         Ok(Json(SearchFulltextResult { hits }))
     }
 }
 
 impl HusmoServer {
     /// Converts `document` to its wire DTO, resolving its `related` ids to
-    /// `(id, title)` references against the data repo (see
-    /// [`resolve_related_refs`]).
-    fn document_to_dto(&self, document: Document) -> Result<DocumentDto, ErrorData> {
-        let related = resolve_related_refs(&self.data_repo_path, &document.related)
-            .map_err(|error| store_error_to_mcp_error(&error))?;
-        Ok(DocumentDto::from_document(document, related))
+    /// `(id, title)` references against the already-loaded `documents`
+    /// (see [`resolve_related_refs`]).
+    ///
+    /// Takes the full Document list rather than reloading it from disk, so
+    /// that converting many hits from one search call (each with its own
+    /// Related references to resolve) costs one directory read overall
+    /// rather than one per hit.
+    fn document_to_dto(document: Document, documents: &[Document]) -> DocumentDto {
+        let related = resolve_related_refs(documents, &document.related);
+        DocumentDto::from_document(document, related)
     }
 
     /// Converts a [`SemanticSearchHit`] to its wire DTO, rendering both the
     /// hit's own Document and every Document in `expanded_related` as
-    /// DTOs (each with its own Related list resolved in turn).
-    fn semantic_hit_to_dto(&self, hit: SemanticSearchHit) -> Result<SemanticSearchHitDto, ErrorData> {
+    /// DTOs (each with its own Related list resolved against `documents`
+    /// in turn).
+    fn semantic_hit_to_dto(hit: SemanticSearchHit, documents: &[Document]) -> SemanticSearchHitDto {
         let expanded_related = hit
             .expanded_related
             .into_iter()
-            .map(|document| self.document_to_dto(document))
-            .collect::<Result<Vec<_>, ErrorData>>()?;
-        Ok(SemanticSearchHitDto {
-            document: self.document_to_dto(hit.document)?,
+            .map(|document| Self::document_to_dto(document, documents))
+            .collect();
+        SemanticSearchHitDto {
+            document: Self::document_to_dto(hit.document, documents),
             score: hit.score,
             matched_chunk: hit.matched_chunk,
             expanded_related,
-        })
+        }
     }
 
-    /// Converts a [`FullTextSearchHit`] to its wire DTO.
-    fn fulltext_hit_to_dto(&self, hit: FullTextSearchHit) -> Result<FulltextSearchHitDto, ErrorData> {
-        Ok(FulltextSearchHitDto {
-            document: self.document_to_dto(hit.document)?,
+    /// Converts a [`FullTextSearchHit`] to its wire DTO, resolving its
+    /// Related references against the already-loaded `documents`.
+    fn fulltext_hit_to_dto(hit: FullTextSearchHit, documents: &[Document]) -> FulltextSearchHitDto {
+        FulltextSearchHitDto {
+            document: Self::document_to_dto(hit.document, documents),
             match_count: hit.match_count,
-        })
+        }
     }
 }
 
