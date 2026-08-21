@@ -1,0 +1,21 @@
+[package]
+name = "husmo"
+version = "0.1.0"
+edition = "2024"
+description = "Local-first, git-backed document/link database with a Rust MCP server"
+
+[[bin]]
+name = "husmo"
+path = "src/main.rs"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+allow_attributes = "deny"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
