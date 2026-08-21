@@ -32,12 +32,15 @@ pub struct Extracted {
     /// Document later, one level deep, never automatically (see
     /// `docs/ARCHITECTURE.md`, "Content extraction").
     pub outgoing_links: Vec<OutgoingLink>,
-    /// Every image discovered in the content, in the order they appear.
-    /// `markdown` still points at each image's original remote URL —
-    /// downloading the bytes and rewriting those references to local
-    /// copies is [`crate::images::localize_images`]'s job, kept out of this
-    /// module so extraction itself stays free of network and filesystem
-    /// I/O.
+    /// Every `http`/`https` image discovered in the content, in the order
+    /// they appear. `markdown` still points at each image's original
+    /// remote URL — downloading the bytes and rewriting those references
+    /// to local copies is [`crate::images::localize_images`]'s job, kept
+    /// out of this module so extraction itself stays free of network and
+    /// filesystem I/O. An image whose `src` isn't `http`/`https` (a
+    /// `data:` URI, say) is still rendered inline in `markdown` but left
+    /// out of this list — there's nothing for `localize_images` to
+    /// download for it.
     pub images: Vec<ExtractedImage>,
 }
 
@@ -304,9 +307,10 @@ fn render_link(
 /// resolved to a URL — an `<img>` has no fallback text to fall back to.
 /// Also records the image in `images` so a caller can download its bytes
 /// and rewrite this reference to a local copy later (see
-/// `crate::images::localize_images`); unlike [`render_link`]'s outgoing
-/// links, every resolved image is recorded — there's no non-`http`/
-/// same-page-fragment case to exclude here.
+/// `crate::images::localize_images`), restricted to `http`/`https` sources
+/// the same way [`render_link`] restricts outgoing links: a `data:` URI
+/// already carries its bytes inline, with nothing to download, so it's
+/// rendered inline only and excluded from `images`.
 fn render_image(
     element: ElementRef<'_>,
     base: Option<&Url>,
@@ -323,11 +327,14 @@ fn render_image(
         .map(collapse_whitespace)
         .unwrap_or_default();
     let url = resolved_url.to_string();
+    let is_http = resolved_url.scheme() == "http" || resolved_url.scheme() == "https";
 
-    collected.images.push(ExtractedImage {
-        alt: alt.clone(),
-        url: url.clone(),
-    });
+    if is_http {
+        collected.images.push(ExtractedImage {
+            alt: alt.clone(),
+            url: url.clone(),
+        });
+    }
 
     out.push_str("![");
     out.push_str(&alt);
@@ -621,6 +628,31 @@ mod tests {
                 alt: "A cat".to_string(),
                 url: "https://example.com/cat.png".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn extract_renders_a_data_uri_image_inline_but_excludes_it_from_images() {
+        let html = "<html><body><article>\
+            <p><img src=\"data:image/png;base64,aGVsbG8=\" alt=\"Inline\"></p>\
+            <p><img src=\"/cat.png\" alt=\"A cat\"></p>\
+            </article></body></html>";
+
+        let extracted = extract(html, "https://example.com/post");
+
+        assert_eq!(
+            extracted.markdown,
+            "![Inline](data:image/png;base64,aGVsbG8=)\n\n![A cat](https://example.com/cat.png)",
+            "a data: URI has nothing to download, but it's still a valid inline image"
+        );
+        assert_eq!(
+            extracted.images,
+            vec![ExtractedImage {
+                alt: "A cat".to_string(),
+                url: "https://example.com/cat.png".to_string(),
+            }],
+            "the data: URI image should be excluded from `images` since there's nothing for \
+             localize_images to fetch for it"
         );
     }
 

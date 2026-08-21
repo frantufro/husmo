@@ -48,6 +48,15 @@ pub enum ImageError {
 /// counter before the extension, the same way Document slugs are deduped
 /// (see [`crate::document::dedupe_slug`]).
 ///
+/// Two entries that share the same URL are downloaded and written only
+/// once: `markdown.replace` already rewrites every occurrence of that URL
+/// the first time it's encountered, so re-downloading it for a later
+/// duplicate would just write an orphan, unreferenced file to `dest_dir`.
+///
+/// An image whose URL isn't `http`/`https` (a `data:` URI, say) is left
+/// untouched — there are no bytes to fetch for it, and `markdown` already
+/// carries it inline.
+///
 /// # Errors
 ///
 /// Returns [`ImageError::Fetch`] if an image's bytes can't be downloaded, or
@@ -59,8 +68,19 @@ pub fn localize_images(
 ) -> Result<String, ImageError> {
     let mut markdown = markdown.to_string();
     let mut used_filenames = HashSet::new();
+    let mut localized_urls = HashSet::new();
 
     for image in images {
+        if !is_fetchable(&image.url) {
+            continue;
+        }
+
+        if !localized_urls.insert(image.url.clone()) {
+            // Already downloaded, written, and replaced throughout
+            // `markdown` for an earlier entry with this same URL.
+            continue;
+        }
+
         let bytes = fetch::fetch_bytes(&image.url).map_err(|source| ImageError::Fetch {
             url: image.url.clone(),
             source,
@@ -76,6 +96,16 @@ pub fn localize_images(
     }
 
     Ok(markdown)
+}
+
+/// True when `url` uses a scheme that can actually be downloaded over the
+/// network (`http`/`https`). A `data:` URI, for instance, carries its bytes
+/// inline rather than pointing at a server to fetch them from, so
+/// `fetch::fetch_bytes` has nothing to ask for and would only fail on it.
+fn is_fetchable(url: &str) -> bool {
+    url::Url::parse(url)
+        .map(|url| url.scheme() == "http" || url.scheme() == "https")
+        .unwrap_or(false)
 }
 
 /// Derives a local filename for `url` from its last path segment, deduped
@@ -196,6 +226,64 @@ mod tests {
             std::fs::read(dest_dir.path().join("photo-2.jpg"))
                 .expect("second image should exist"),
             second_bytes
+        );
+    }
+
+    #[test]
+    fn localize_images_leaves_non_http_image_urls_untouched() {
+        let images = vec![ExtractedImage {
+            alt: "Inline".to_string(),
+            url: "data:image/png;base64,aGVsbG8=".to_string(),
+        }];
+        let markdown = "![Inline](data:image/png;base64,aGVsbG8=)";
+        let dest_dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let rewritten = localize_images(markdown, &images, dest_dir.path())
+            .expect("localize_images should succeed");
+
+        assert_eq!(rewritten, markdown, "a data: URI has nothing to fetch, so it's left as-is");
+        assert_eq!(
+            std::fs::read_dir(dest_dir.path())
+                .expect("dest dir should be readable")
+                .count(),
+            0,
+            "no file should have been written for a non-http image"
+        );
+    }
+
+    #[test]
+    fn localize_images_downloads_a_repeated_url_only_once() {
+        let image_bytes: &[u8] = b"shared-bytes";
+        let url = one_shot_image_server(image_bytes, "shared.png");
+        let images = vec![
+            ExtractedImage {
+                alt: "First".to_string(),
+                url: url.clone(),
+            },
+            ExtractedImage {
+                alt: "Second".to_string(),
+                url: url.clone(),
+            },
+        ];
+        let markdown = format!("![First]({url})\n\n![Second]({url})");
+        let dest_dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let rewritten = localize_images(&markdown, &images, dest_dir.path())
+            .expect("localize_images should succeed");
+
+        assert_eq!(
+            rewritten,
+            "![First](shared.png)\n\n![Second](shared.png)",
+            "both references to the same URL should point at the same local file"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dest_dir.path())
+            .expect("dest dir should be readable")
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a repeated URL should only be downloaded and written once, not left behind as an \
+             orphan duplicate file"
         );
     }
 
