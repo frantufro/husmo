@@ -4,6 +4,7 @@
 //! `docs/adr/0001-local-first-no-external-services.md` for why this project
 //! avoids external services.
 
+pub mod archive;
 pub mod chunk;
 pub mod config;
 pub mod document;
