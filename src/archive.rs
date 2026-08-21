@@ -14,12 +14,13 @@
 
 use std::path::Path;
 
-use crate::document::{Document, dedupe_slug};
+use crate::document::Document;
 use crate::embeddings::{DocumentEmbeddings, EmbeddingsError};
-use crate::extract::{self, OutgoingLink};
-use crate::fetch::{self, FetchError};
-use crate::images::{self, ImageError};
+use crate::extract::OutgoingLink;
+use crate::fetch::FetchError;
+use crate::images::ImageError;
 use crate::store::{self, StoreError};
+use crate::url_ingest::{UrlIngestError, fetch_and_build_document};
 
 /// An error encountered while archiving an outgoing link.
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +39,16 @@ pub enum ArchiveError {
     /// Writing the new Document's embeddings sidecar failed.
     #[error(transparent)]
     Embeddings(#[from] EmbeddingsError),
+}
+
+impl From<UrlIngestError> for ArchiveError {
+    fn from(error: UrlIngestError) -> Self {
+        match error {
+            UrlIngestError::Fetch(source) => ArchiveError::Fetch(source),
+            UrlIngestError::Image(source) => ArchiveError::Image(source),
+            UrlIngestError::Store(source) => ArchiveError::Store(source),
+        }
+    }
 }
 
 /// The result of archiving one outgoing link: the new Document it became,
@@ -79,28 +90,7 @@ pub struct ArchivedLink {
 /// or [`ArchiveError::Store`]/[`ArchiveError::Embeddings`] if writing the
 /// Document or its embeddings sidecar fails.
 pub fn archive_outgoing_link(dir: &Path, link: &OutgoingLink) -> Result<ArchivedLink, ArchiveError> {
-    let html = fetch::fetch(&link.url)?;
-    let extracted = extract::extract(&html, &link.url);
-
-    let title = extracted.title.unwrap_or_else(|| link.text.clone());
-    let mut document = Document::new(title, String::new());
-    document.canonical_url = Some(link.url.clone());
-
-    match store::resolve(dir, &store::Identifier::Url(link.url.clone())) {
-        Ok(existing) => {
-            // A Document for this canonical_url already exists — overwrite
-            // it in place by reusing its id and slug, rather than creating
-            // a second Document for the same URL.
-            document.id = existing.id;
-            document.slug = existing.slug;
-        }
-        Err(store::ResolveError::NotFound(_)) => {
-            document.slug = dedupe_slug(&document.slug, &store::existing_slugs(dir)?);
-        }
-        Err(store::ResolveError::Store(source)) => return Err(ArchiveError::Store(source)),
-    }
-
-    document.content = images::localize_images(&extracted.markdown, &extracted.images, dir)?;
+    let (document, outgoing_links) = fetch_and_build_document(dir, &link.url, &link.text)?;
 
     store::write(dir, &document)?;
     let embeddings = DocumentEmbeddings::build(&document);
@@ -108,7 +98,7 @@ pub fn archive_outgoing_link(dir: &Path, link: &OutgoingLink) -> Result<Archived
 
     Ok(ArchivedLink {
         document,
-        outgoing_links: extracted.outgoing_links,
+        outgoing_links,
     })
 }
 

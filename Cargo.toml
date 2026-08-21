@@ -25,7 +25,19 @@ scraper = "0.27.0"
 ego-tree = "0.11.0"
 url = "2.5.8"
 pdf-extract = "0.12.0"
+rmcp = { version = "3.1.4", features = ["server", "transport-io", "macros", "schemars"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+# The `schemars::JsonSchema` derive macro's generated code refers to the
+# `schemars` crate by its plain name, so it must be a direct dependency here
+# even though `rmcp` already re-exports the crate itself (`rmcp::schemars`).
+schemars = "1.0"
 
 [dev-dependencies]
 lopdf = "0.44.0"
 tempfile = "3"
+# Only "client" is added here: it lets tests drive the MCP server through a
+# real client/server round trip (see `src/mcp_server.rs`'s tests). Everything
+# else the server needs is already in the main `rmcp` dependency above.
+rmcp = { version = "3.1.4", features = ["client"] }
+# Only "io-util" is added here, for `tokio::io::duplex` in the same tests.
+tokio = { version = "1", features = ["io-util"] }
