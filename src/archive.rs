@@ -56,22 +56,28 @@ pub struct ArchivedLink {
 
 /// Archives `link` as its own Document inside `dir`: fetches `link.url`
 /// (plain HTTP, per `docs/ARCHITECTURE.md`), extracts it to Markdown,
-/// downloads and localizes its images, and writes the result as a new
-/// Document whose `canonical_url` is `link.url` — one level deep, exactly
-/// like a top-level URL save would. The new Document's own outgoing links
-/// are reported on the returned [`ArchivedLink::outgoing_links`] rather than
-/// archived automatically, so this call never recurses beyond the one link
-/// it was asked to archive.
+/// downloads and localizes its images, and writes the result as a Document
+/// whose `canonical_url` is `link.url` — one level deep, exactly like a
+/// top-level URL save would. Per `docs/ARCHITECTURE.md`'s "Storage model"
+/// invariant, a `canonical_url` identifies at most one Document: if one
+/// already exists for `link.url` (whether from an earlier archiving of this
+/// same link, or because it was already saved as a top-level Document),
+/// this overwrites that Document's content in place — reusing its existing
+/// `id` and `slug` — instead of minting a second Document for the same URL.
+/// The new/updated Document's own outgoing links are reported on the
+/// returned [`ArchivedLink::outgoing_links`] rather than archived
+/// automatically, so this call never recurses beyond the one link it was
+/// asked to archive.
 ///
-/// The new Document's title comes from the fetched page's `<title>`, or
-/// falls back to `link.text` when the page has none.
+/// The Document's title comes from the fetched page's `<title>`, or falls
+/// back to `link.text` when the page has none.
 ///
 /// # Errors
 ///
 /// Returns [`ArchiveError::Fetch`] if `link.url` can't be fetched,
 /// [`ArchiveError::Image`] if one of the page's images can't be downloaded,
 /// or [`ArchiveError::Store`]/[`ArchiveError::Embeddings`] if writing the
-/// new Document or its embeddings sidecar fails.
+/// Document or its embeddings sidecar fails.
 pub fn archive_outgoing_link(dir: &Path, link: &OutgoingLink) -> Result<ArchivedLink, ArchiveError> {
     let html = fetch::fetch(&link.url)?;
     let extracted = extract::extract(&html, &link.url);
@@ -79,7 +85,21 @@ pub fn archive_outgoing_link(dir: &Path, link: &OutgoingLink) -> Result<Archived
     let title = extracted.title.unwrap_or_else(|| link.text.clone());
     let mut document = Document::new(title, String::new());
     document.canonical_url = Some(link.url.clone());
-    document.slug = dedupe_slug(&document.slug, &store::existing_slugs(dir)?);
+
+    match store::resolve(dir, &store::Identifier::Url(link.url.clone())) {
+        Ok(existing) => {
+            // A Document for this canonical_url already exists — overwrite
+            // it in place by reusing its id and slug, rather than creating
+            // a second Document for the same URL.
+            document.id = existing.id;
+            document.slug = existing.slug;
+        }
+        Err(store::ResolveError::NotFound(_)) => {
+            document.slug = dedupe_slug(&document.slug, &store::existing_slugs(dir)?);
+        }
+        Err(store::ResolveError::Store(source)) => return Err(ArchiveError::Store(source)),
+    }
+
     document.content = images::localize_images(&extracted.markdown, &extracted.images, dir)?;
 
     store::write(dir, &document)?;
@@ -118,6 +138,31 @@ mod tests {
             stream
                 .write_all(response.as_bytes())
                 .expect("failed to write test response");
+        });
+        format!("http://{addr}/")
+    }
+
+    /// Like [`one_shot_page_server`], but binds once and answers two
+    /// sequential connections in order, with `first_body` then
+    /// `second_body`. Used to archive the same URL twice against a server
+    /// that stays alive for both fetches.
+    fn two_shot_page_server(first_body: &'static str, second_body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind test listener");
+        let addr = listener.local_addr().expect("failed to read local addr");
+        std::thread::spawn(move || {
+            for body in [first_body, second_body] {
+                let (mut stream, _) = listener.accept().expect("failed to accept connection");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("failed to write test response");
+            }
         });
         format!("http://{addr}/")
     }
@@ -186,5 +231,50 @@ mod tests {
             1,
             "only the one archived Document should exist — no automatic recursion"
         );
+    }
+
+    #[test]
+    fn archive_outgoing_link_overwrites_an_existing_document_for_the_same_url_in_place() {
+        let url = two_shot_page_server(
+            "<html><head><title>Discovered Page</title></head>\
+             <body><article><p>Some discovered content.</p></article></body></html>",
+            "<html><head><title>Discovered Page</title></head>\
+             <body><article><p>Updated discovered content.</p></article></body></html>",
+        );
+        let link = OutgoingLink {
+            text: "Discovered".to_string(),
+            url: url.clone(),
+        };
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let first =
+            archive_outgoing_link(dir.path(), &link).expect("first archiving should succeed");
+
+        let second =
+            archive_outgoing_link(dir.path(), &link).expect("second archiving should succeed");
+
+        assert_eq!(
+            second.document.id, first.document.id,
+            "re-archiving the same url should reuse the existing Document's id"
+        );
+        assert_eq!(
+            second.document.slug, first.document.slug,
+            "re-archiving the same url should reuse the existing Document's slug"
+        );
+        assert_eq!(
+            second.document.content, "Updated discovered content.",
+            "re-archiving the same url should overwrite the existing Document's content"
+        );
+
+        let all_documents = store::load_all(dir.path()).expect("load_all should succeed");
+        assert_eq!(
+            all_documents.len(),
+            1,
+            "re-archiving the same url should not create a second Document"
+        );
+
+        let on_disk = store::resolve(dir.path(), &store::Identifier::Url(url))
+            .expect("the document should still be resolvable by url");
+        assert_eq!(on_disk, second.document);
     }
 }
