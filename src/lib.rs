@@ -24,5 +24,7 @@ pub mod save;
 pub mod semantic_search;
 pub mod store;
 pub mod tag_search;
+#[cfg(test)]
+mod test_support;
 mod url_ingest;
 pub mod vector_index;

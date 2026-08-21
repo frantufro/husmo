@@ -87,22 +87,34 @@ enum CommitOutcome {
     NoChanges,
 }
 
-/// Builds the remote callbacks used for fetch and push: an SSH key from the
-/// running ssh-agent for `git+ssh` remotes, falling back to the system
-/// credential helper configured in `repo`'s git config (covers HTTPS
-/// remotes with a stored token/password) and finally to whatever default
-/// credential git2 can produce. Remotes that need no authentication at all
-/// (e.g. a local `file://` path, as in the tests) never invoke this.
-fn remote_callbacks(repo: &Repository) -> git2::RemoteCallbacks<'_> {
+/// Builds the remote callbacks used for fetch, push, and (via
+/// [`crate::init`]) the initial clone: an SSH key from the running
+/// ssh-agent for `git+ssh` remotes, falling back to a system credential
+/// helper (covers HTTPS remotes with a stored token/password) and finally
+/// to whatever default credential git2 can produce. Remotes that need no
+/// authentication at all (e.g. a local `file://` path, as in the tests)
+/// never invoke this.
+///
+/// `repo` supplies the git config the credential helper is read from, when
+/// one is already open (the normal `pull`/`push` case). `husmo init` calls
+/// this before any repo exists locally yet, and passes `None` — the
+/// credential helper then falls back to the process-wide default config
+/// (global `~/.gitconfig` and system config), which is where a credential
+/// helper for a fresh clone would be configured anyway.
+pub(crate) fn remote_callbacks(repo: Option<&Repository>) -> git2::RemoteCallbacks<'_> {
     let mut callbacks = git2::RemoteCallbacks::new();
-    callbacks.credentials(|url, username_from_url, allowed_types| {
+    callbacks.credentials(move |url, username_from_url, allowed_types| {
         if allowed_types.contains(git2::CredentialType::SSH_KEY)
             && let Some(username) = username_from_url
             && let Ok(credential) = git2::Cred::ssh_key_from_agent(username)
         {
             return Ok(credential);
         }
-        if let Ok(config) = repo.config()
+        let config = match repo {
+            Some(repo) => repo.config(),
+            None => git2::Config::open_default(),
+        };
+        if let Ok(config) = config
             && let Ok(credential) = git2::Cred::credential_helper(&config, url, username_from_url)
         {
             return Ok(credential);
@@ -119,7 +131,7 @@ fn remote_callbacks(repo: &Repository) -> git2::RemoteCallbacks<'_> {
 fn pull(repo: &Repository) -> Result<(), git2::Error> {
     let mut remote = repo.find_remote(REMOTE_NAME)?;
     let mut fetch_options = git2::FetchOptions::new();
-    fetch_options.remote_callbacks(remote_callbacks(repo));
+    fetch_options.remote_callbacks(remote_callbacks(Some(repo)));
     remote.fetch::<&str>(&[], Some(&mut fetch_options), None)?;
 
     let fetch_head = repo.find_reference("FETCH_HEAD")?;
@@ -177,7 +189,7 @@ fn commit_all(repo: &Repository, message: &str) -> Result<CommitOutcome, git2::E
 fn push(repo: &Repository) -> Result<(), git2::Error> {
     let mut remote = repo.find_remote(REMOTE_NAME)?;
     let mut push_options = git2::PushOptions::new();
-    push_options.remote_callbacks(remote_callbacks(repo));
+    push_options.remote_callbacks(remote_callbacks(Some(repo)));
     let head = repo.head()?;
     let refname = head.name()?;
     remote.push(&[format!("{refname}:{refname}")], Some(&mut push_options))
@@ -190,31 +202,7 @@ mod tests {
     use git2::Repository;
     use tempfile::TempDir;
 
-    /// Creates a bare "remote" repo with one seeded commit (a file named
-    /// `seed.txt`) on its default branch, so a clone of it has a HEAD to
-    /// work from.
-    fn seeded_bare_remote() -> (TempDir, std::path::PathBuf) {
-        let remote_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let remote_path = remote_dir.path().join("remote.git");
-        Repository::init_bare(&remote_path).expect("failed to init bare remote");
-
-        // Seed it via a throwaway working clone, since a fresh bare repo has
-        // no branches to clone from yet.
-        let seed_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let seed_repo = Repository::init(seed_dir.path()).expect("failed to init seed repo");
-        std::fs::write(seed_dir.path().join("seed.txt"), "seed\n").expect("failed to write seed");
-        commit_all(&seed_repo, "seed");
-        let mut remote = seed_repo
-            .remote("origin", remote_path.to_str().expect("path is utf8"))
-            .expect("failed to add remote");
-        let head = seed_repo.head().expect("seed repo should have a HEAD");
-        let refname = head.name().expect("HEAD should be named").to_string();
-        remote
-            .push(&[format!("{refname}:{refname}")], None)
-            .expect("failed to push seed commit");
-
-        (remote_dir, remote_path)
-    }
+    use crate::test_support::seeded_bare_remote;
 
     /// Clones `remote_path` into a fresh temp dir, returning the clone.
     fn clone_local(remote_path: &Path) -> (TempDir, std::path::PathBuf) {

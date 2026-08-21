@@ -100,11 +100,16 @@ pub fn resolve_repo_url(
 pub fn run(repo_url: &str, dest_dir: &Path, config_path: &Path) -> Result<(), InitError> {
     ensure_empty(dest_dir)?;
 
-    git2::Repository::clone(repo_url, dest_dir).map_err(|source| InitError::Clone {
-        url: repo_url.to_string(),
-        dest: dest_dir.to_path_buf(),
-        source,
-    })?;
+    let mut fetch_options = git2::FetchOptions::new();
+    fetch_options.remote_callbacks(crate::git_sync::remote_callbacks(None));
+    git2::build::RepoBuilder::new()
+        .fetch_options(fetch_options)
+        .clone(repo_url, dest_dir)
+        .map_err(|source| InitError::Clone {
+            url: repo_url.to_string(),
+            dest: dest_dir.to_path_buf(),
+            source,
+        })?;
 
     write_config(config_path, dest_dir)
 }
@@ -153,42 +158,7 @@ fn write_config(config_path: &Path, data_repo_path: &Path) -> Result<(), InitErr
 
 #[cfg(test)]
 mod tests {
-    /// Creates a bare "remote" repo with one seeded commit (a file named
-    /// `seed.txt`), so `run` has a real, clonable git URL to work with. The
-    /// same fixture shape used in `crate::git_sync`'s own tests.
-    fn seeded_bare_remote() -> (tempfile::TempDir, std::path::PathBuf) {
-        let remote_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let remote_path = remote_dir.path().join("remote.git");
-        git2::Repository::init_bare(&remote_path).expect("failed to init bare remote");
-
-        let seed_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let seed_repo = git2::Repository::init(seed_dir.path()).expect("failed to init seed repo");
-        std::fs::write(seed_dir.path().join("seed.txt"), "seed\n").expect("failed to write seed");
-
-        let mut index = seed_repo.index().expect("failed to get index");
-        index
-            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
-            .expect("failed to stage files");
-        index.write().expect("failed to write index");
-        let tree_id = index.write_tree().expect("failed to write tree");
-        let tree = seed_repo.find_tree(tree_id).expect("failed to find tree");
-        let signature =
-            git2::Signature::now("Test", "test@example.com").expect("failed to build signature");
-        seed_repo
-            .commit(Some("HEAD"), &signature, &signature, "seed", &tree, &[])
-            .expect("failed to commit seed");
-
-        let mut remote = seed_repo
-            .remote("origin", remote_path.to_str().expect("path is utf8"))
-            .expect("failed to add remote");
-        let head = seed_repo.head().expect("seed repo should have a HEAD");
-        let refname = head.name().expect("HEAD should be named").to_string();
-        remote
-            .push(&[format!("{refname}:{refname}")], None)
-            .expect("failed to push seed commit");
-
-        (remote_dir, remote_path)
-    }
+    use crate::test_support::seeded_bare_remote;
 
     #[test]
     fn run_clones_the_repo_into_the_destination_and_writes_a_config_pointing_at_it() {
