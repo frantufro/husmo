@@ -84,10 +84,20 @@ Four distinct capabilities — do not collapse into one fuzzy "search":
 - Documents are split into chunks (paragraph/section-sized) before
   embedding — not embedded as one whole-document vector. Better recall
   against long content.
-- Embeddings are generated **locally, in-process** (e.g. via `candle`
-  running a small local model). No network calls, no external embeddings
-  API. This is a deliberate project value — see ADR 0001, and state it in
-  the README.
+- Embeddings are generated **locally, in-process**, with zero network
+  calls and no external embeddings API. This is a deliberate project
+  value — see ADR 0001, and state it in the README.
+- The current implementation (`src/embed.rs`) is a deterministic
+  feature-hashing bag-of-words vector: each token is hashed into a fixed
+  slot with a sign, slots are accumulated, and the result is
+  L2-normalized. It stays small and dependency-free, and its cosine
+  similarity reflects shared vocabulary well. A trained local model (e.g.
+  via `candle`) would generalize further, to synonyms and paraphrase. The
+  sidecar file format is agnostic to which function produced the vectors,
+  so upgrading the embedding function later is a drop-in change; a
+  semantic-search implementation built on today's vectors should expect
+  results closer to vocabulary overlap than to true semantic
+  generalization.
 - Each Document's chunk embeddings are committed to the data repo as small
   per-Document sidecar files — not one giant shared blob.
 - The assembled searchable vector index (e.g. `usearch` or a pure-Rust HNSW
