@@ -225,10 +225,11 @@ fn wrap_inline(
 
 /// Renders an `<a>` element as a Markdown link, resolving its `href`
 /// against `base`. Falls back to plain text if there's no `href` or it
-/// can't be resolved to a URL. Also records the link in `links`, but only
-/// when its target is an archivable `http`/`https` page — a `mailto:` or
-/// `javascript:` href is still rendered inline, but isn't a page that could
-/// be saved as its own Document.
+/// can't be resolved to a URL. Also records the link in `links`, restricted
+/// to targets that are archivable `http`/`https` pages distinct from the
+/// page the link was found on: a `mailto:`/`javascript:` href is rendered
+/// inline only, and a same-page fragment link (`href="#toc"`) resolves to
+/// the page's own URL, so both are excluded from `links`.
 fn render_link(
     element: ElementRef<'_>,
     base: Option<&Url>,
@@ -236,18 +237,18 @@ fn render_link(
     links: &mut Vec<OutgoingLink>,
 ) {
     let text = render_children_to_string(element, base, links);
-    let resolved = element
-        .value()
-        .attr("href")
-        .and_then(|href| resolve_url(base, href));
+    let href = element.value().attr("href");
+    let resolved = href.and_then(|href| resolve_url(base, href));
 
-    let Some(url) = resolved else {
+    let Some(resolved_url) = resolved else {
         out.push_str(&text);
         return;
     };
 
+    let url = resolved_url.to_string();
     let display_text = if text.is_empty() { url.clone() } else { text };
-    if url.starts_with("http://") || url.starts_with("https://") {
+    let is_http = resolved_url.scheme() == "http" || resolved_url.scheme() == "https";
+    if is_http && !is_same_page_fragment(base, &resolved_url) {
         links.push(OutgoingLink {
             text: display_text.clone(),
             url: url.clone(),
@@ -261,13 +262,28 @@ fn render_link(
     out.push(')');
 }
 
-/// Resolves `href` to an absolute URL string against `base`, if possible.
-fn resolve_url(base: Option<&Url>, href: &str) -> Option<String> {
-    let resolved = match base {
-        Some(base) => base.join(href).ok()?,
-        None => Url::parse(href).ok()?,
+/// Resolves `href` to an absolute [`Url`] against `base`, if possible.
+fn resolve_url(base: Option<&Url>, href: &str) -> Option<Url> {
+    match base {
+        Some(base) => base.join(href).ok(),
+        None => Url::parse(href).ok(),
+    }
+}
+
+/// True when `resolved` is a same-page fragment reference — it points at
+/// the page it was found on (ignoring any `#fragment`), such as an in-page
+/// table-of-contents link (`href="#toc"`). Such a link isn't a distinct
+/// page a caller could archive as its own Document, even though it
+/// resolves to an absolute `http`/`https` URL.
+fn is_same_page_fragment(base: Option<&Url>, resolved: &Url) -> bool {
+    let Some(base) = base else {
+        return false;
     };
-    Some(resolved.to_string())
+    let mut base_without_fragment = base.clone();
+    base_without_fragment.set_fragment(None);
+    let mut resolved_without_fragment = resolved.clone();
+    resolved_without_fragment.set_fragment(None);
+    base_without_fragment == resolved_without_fragment
 }
 
 /// Renders a `<ul>`/`<ol>`'s direct `<li>` children as Markdown list items.
@@ -427,6 +443,28 @@ mod tests {
     }
 
     #[test]
+    fn extract_excludes_same_page_fragment_links_from_outgoing_links() {
+        let html = "<html><body><article>\
+            <p><a href=\"#toc\">Table of contents</a></p>\
+            <p><a href=\"https://example.com/post#toc\">Also table of contents</a></p>\
+            <p><a href=\"https://real.example/\">Real link</a></p>\
+            </article></body></html>";
+
+        let extracted = extract(html, "https://example.com/post");
+
+        assert_eq!(
+            extracted.outgoing_links,
+            vec![OutgoingLink {
+                text: "Real link".to_string(),
+                url: "https://real.example/".to_string(),
+            }],
+            "a same-page fragment link resolves to the page's own URL, so it isn't a distinct \
+             page a caller could archive as its own Document"
+        );
+        assert!(extracted.markdown.contains("[Table of contents](https://example.com/post#toc)"));
+    }
+
+    #[test]
     fn extract_drops_boilerplate_elements_wherever_they_appear() {
         let html = "<html><body>\
             <nav>Home | About</nav>\
@@ -436,6 +474,29 @@ mod tests {
             </article>\
             <footer>Copyright 2026</footer>\
             </body></html>";
+
+        let extracted = extract(html, "https://example.com/post");
+
+        assert_eq!(extracted.markdown, "Real content.");
+    }
+
+    #[test]
+    fn extract_drops_boilerplate_elements_nested_inside_the_content_root() {
+        // Each dropped tag sits *inside* the chosen content root (<article>)
+        // here, unlike the sibling placement in
+        // `extract_drops_boilerplate_elements_wherever_they_appear` — this
+        // is what actually exercises DROPPED_ELEMENTS during the walk,
+        // since a sibling of the root is never visited regardless of that
+        // set's contents.
+        let html = "<html><body><article>\
+            <nav>In-article nav</nav>\
+            <header>In-article header</header>\
+            <p>Real content.</p>\
+            <form><input type=\"email\"></form>\
+            <aside>In-article aside</aside>\
+            <footer>In-article footer</footer>\
+            <noscript>Enable JS</noscript>\
+            </article></body></html>";
 
         let extracted = extract(html, "https://example.com/post");
 
