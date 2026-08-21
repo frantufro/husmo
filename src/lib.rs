@@ -10,4 +10,5 @@ pub mod extract;
 pub mod fetch;
 pub mod git_sync;
 pub mod images;
+pub mod local_file;
 pub mod store;
