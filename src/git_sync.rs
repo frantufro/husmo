@@ -71,11 +71,45 @@ pub fn sync_write<T, E>(
 
     let result = write().map_err(SyncError::Write)?;
 
-    commit_all(&repo, message).map_err(SyncError::Commit)?;
-
-    push(&repo).map_err(SyncError::Push)?;
+    if let CommitOutcome::Committed = commit_all(&repo, message).map_err(SyncError::Commit)? {
+        push(&repo).map_err(SyncError::Push)?;
+    }
 
     Ok(result)
+}
+
+/// Whether [`commit_all`] produced a new commit or found nothing to commit.
+enum CommitOutcome {
+    /// A new commit was created on top of the previous HEAD.
+    Committed,
+    /// The working tree matched the previous HEAD's tree exactly, so no
+    /// commit was made.
+    NoChanges,
+}
+
+/// Builds the remote callbacks used for fetch and push: an SSH key from the
+/// running ssh-agent for `git+ssh` remotes, falling back to the system
+/// credential helper configured in `repo`'s git config (covers HTTPS
+/// remotes with a stored token/password) and finally to whatever default
+/// credential git2 can produce. Remotes that need no authentication at all
+/// (e.g. a local `file://` path, as in the tests) never invoke this.
+fn remote_callbacks(repo: &Repository) -> git2::RemoteCallbacks<'_> {
+    let mut callbacks = git2::RemoteCallbacks::new();
+    callbacks.credentials(|url, username_from_url, allowed_types| {
+        if allowed_types.contains(git2::CredentialType::SSH_KEY)
+            && let Some(username) = username_from_url
+            && let Ok(credential) = git2::Cred::ssh_key_from_agent(username)
+        {
+            return Ok(credential);
+        }
+        if let Ok(config) = repo.config()
+            && let Ok(credential) = git2::Cred::credential_helper(&config, url, username_from_url)
+        {
+            return Ok(credential);
+        }
+        git2::Cred::default()
+    });
+    callbacks
 }
 
 /// Fetches from `origin` and fast-forwards the current branch to match, if
@@ -84,7 +118,9 @@ pub fn sync_write<T, E>(
 /// out of scope for now (see the module docs).
 fn pull(repo: &Repository) -> Result<(), git2::Error> {
     let mut remote = repo.find_remote(REMOTE_NAME)?;
-    remote.fetch::<&str>(&[], None, None)?;
+    let mut fetch_options = git2::FetchOptions::new();
+    fetch_options.remote_callbacks(remote_callbacks(repo));
+    remote.fetch::<&str>(&[], Some(&mut fetch_options), None)?;
 
     let fetch_head = repo.find_reference("FETCH_HEAD")?;
     let fetch_commit = repo.reference_to_annotated_commit(&fetch_head)?;
@@ -110,16 +146,22 @@ fn pull(repo: &Repository) -> Result<(), git2::Error> {
 /// Stages every change in the working tree and commits it on top of HEAD
 /// with `message`, using a fixed `husmo` author/committer identity (the
 /// data repo's commits are made on the user's behalf by the tool, not
-/// authored interactively).
-fn commit_all(repo: &Repository, message: &str) -> Result<git2::Oid, git2::Error> {
+/// authored interactively). Makes no commit, and returns
+/// [`CommitOutcome::NoChanges`], if the staged tree is identical to HEAD's
+/// (e.g. `write` left the working tree exactly as it found it) — there is
+/// nothing meaningful to commit or push in that case.
+fn commit_all(repo: &Repository, message: &str) -> Result<CommitOutcome, git2::Error> {
     let mut index = repo.index()?;
     index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
     index.write()?;
     let tree_id = index.write_tree()?;
+    let parent = repo.head()?.peel_to_commit()?;
+    if tree_id == parent.tree_id() {
+        return Ok(CommitOutcome::NoChanges);
+    }
     let tree = repo.find_tree(tree_id)?;
 
     let signature = git2::Signature::now("husmo", "husmo@localhost")?;
-    let parent = repo.head()?.peel_to_commit()?;
     repo.commit(
         Some("HEAD"),
         &signature,
@@ -127,15 +169,18 @@ fn commit_all(repo: &Repository, message: &str) -> Result<git2::Oid, git2::Error
         message,
         &tree,
         &[&parent],
-    )
+    )?;
+    Ok(CommitOutcome::Committed)
 }
 
 /// Pushes the current branch to `origin`.
 fn push(repo: &Repository) -> Result<(), git2::Error> {
     let mut remote = repo.find_remote(REMOTE_NAME)?;
+    let mut push_options = git2::PushOptions::new();
+    push_options.remote_callbacks(remote_callbacks(repo));
     let head = repo.head()?;
     let refname = head.name()?;
-    remote.push(&[format!("{refname}:{refname}")], None)
+    remote.push(&[format!("{refname}:{refname}")], Some(&mut push_options))
 }
 
 #[cfg(test)]
@@ -363,5 +408,93 @@ mod tests {
         assert!(!write_ran.get(), "write should not run when the pull fails");
         assert!(!local_path.join("hello.txt").is_file());
         assert_eq!(commit_messages(&local_path), vec!["seed".to_string()]);
+    }
+
+    #[test]
+    fn sync_write_fails_on_a_genuine_divergence_between_local_and_remote_history() {
+        let (_remote_dir, remote_path) = seeded_bare_remote();
+        let (_local_dir, local_path) = clone_local(&remote_path);
+
+        // A second machine pulls, writes its own file, and pushes — the
+        // remote now has a commit "local" hasn't seen.
+        let (_other_dir, other_path) = clone_local(&remote_path);
+        std::fs::write(other_path.join("other.txt"), "other machine\n")
+            .expect("failed to write other machine's file");
+        let other_repo = Repository::open(&other_path).expect("failed to open other repo");
+        commit_all(&other_repo, "other machine's change");
+        let mut other_remote = other_repo
+            .find_remote("origin")
+            .expect("other repo should have a remote");
+        let other_refname = other_repo
+            .head()
+            .expect("other repo should have a HEAD")
+            .name()
+            .expect("HEAD should be named")
+            .to_string();
+        other_remote
+            .push(&[format!("{other_refname}:{other_refname}")], None)
+            .expect("other machine's push should succeed");
+
+        // "local" also makes its own commit, without ever pulling the other
+        // machine's change first — so local and remote both moved on from
+        // "seed" independently. Neither is an ancestor of the other.
+        std::fs::write(local_path.join("local-only.txt"), "local machine\n")
+            .expect("failed to write local-only file");
+        let local_repo = Repository::open(&local_path).expect("failed to open local repo");
+        commit_all(&local_repo, "local machine's unpushed change");
+
+        let write_ran = std::cell::Cell::new(false);
+        let result = crate::git_sync::sync_write(&local_path, "should never land", || {
+            write_ran.set(true);
+            std::fs::write(local_path.join("hello.txt"), "hello\n")
+        });
+
+        assert!(
+            matches!(result, Err(crate::git_sync::SyncError::Pull(_))),
+            "a genuine divergence should surface as a pull error, got {result:?}"
+        );
+        assert!(!write_ran.get(), "write should not run when the pull fails");
+        assert!(!local_path.join("hello.txt").is_file());
+        assert!(
+            !local_path.join("other.txt").is_file(),
+            "a failed pull should not partially apply the remote's change"
+        );
+        assert_eq!(
+            commit_messages(&local_path),
+            vec![
+                "seed".to_string(),
+                "local machine's unpushed change".to_string(),
+            ]
+        );
+        assert_eq!(
+            read_file_from_remote_tip(&remote_path, "local-only.txt"),
+            None,
+            "the diverged local commit should not have been pushed"
+        );
+    }
+
+    #[test]
+    fn sync_write_does_not_push_when_write_leaves_the_working_tree_unchanged() {
+        let (_remote_dir, remote_path) = seeded_bare_remote();
+        let (_local_dir, local_path) = clone_local(&remote_path);
+
+        crate::git_sync::sync_write(&local_path, "no-op write", || {
+            // Writes and then removes the same file, so the working tree
+            // ends up byte-for-byte identical to HEAD's tree.
+            std::fs::write(local_path.join("scratch.txt"), "temporary\n")?;
+            std::fs::remove_file(local_path.join("scratch.txt"))
+        })
+        .expect("sync_write should succeed even when there is nothing to commit");
+
+        assert_eq!(
+            commit_messages(&local_path),
+            vec!["seed".to_string()],
+            "no new commit should have been made"
+        );
+        assert_eq!(
+            read_file_from_remote_tip(&remote_path, "scratch.txt"),
+            None,
+            "nothing should have been pushed"
+        );
     }
 }
