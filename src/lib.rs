@@ -5,3 +5,5 @@
 //! avoids external services.
 
 pub mod config;
+pub mod document;
+pub mod store;
