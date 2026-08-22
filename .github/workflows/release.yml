@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            use_cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: '!matrix.use_cross'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          ARCHIVE="husmo-${{ matrix.target }}.tar.gz"
+          tar -czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" husmo
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: husmo-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/husmo-*.tar.gz
+
+  publish-homebrew-formula:
+    name: Publish Homebrew formula
+    needs: release
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute sha256 for each tarball
+        id: sha
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            file="artifacts/husmo-${target}.tar.gz"
+            if [ ! -f "$file" ]; then
+              echo "Missing artifact: $file" >&2
+              exit 1
+            fi
+            sha=$(sha256sum "$file" | awk '{print $1}')
+            slug=$(echo "$target" | tr -- '-' '_')
+            echo "${slug}=${sha}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: frantufro/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Generate formula
+        env:
+          SHA_MAC_ARM: ${{ steps.sha.outputs.aarch64_apple_darwin }}
+          SHA_LINUX_X86: ${{ steps.sha.outputs.x86_64_unknown_linux_gnu }}
+          SHA_LINUX_ARM: ${{ steps.sha.outputs.aarch64_unknown_linux_gnu }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          mkdir -p homebrew-tap/Formula
+          cat > homebrew-tap/Formula/husmo.rb <<EOF
+          class Husmo < Formula
+            desc "Local-first, git-backed document/link database with a Rust MCP server"
+            homepage "https://github.com/frantufro/husmo"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/frantufro/husmo/releases/download/${TAG}/husmo-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/frantufro/husmo/releases/download/${TAG}/husmo-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_X86}"
+              end
+              on_arm do
+                url "https://github.com/frantufro/husmo/releases/download/${TAG}/husmo-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
+              end
+            end
+
+            def install
+              bin.install "husmo"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/husmo --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push formula
+        working-directory: homebrew-tap
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/husmo.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "husmo ${TAG#v}"
+          git push

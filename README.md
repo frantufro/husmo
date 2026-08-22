@@ -38,6 +38,26 @@ Concretely:
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and
 [`CONTEXT.md`](CONTEXT.md) for the domain glossary.
 
+## Install
+
+```bash
+curl -sSL https://raw.githubusercontent.com/frantufro/husmo/main/install.sh | sh
+```
+
+Or via Homebrew (macOS and Linux):
+
+```bash
+brew install frantufro/tap/husmo
+```
+
+Or build and install from source:
+
+```bash
+git clone https://github.com/frantufro/husmo.git
+cd husmo
+cargo install --path .
+```
+
 ## Setup
 
 husmo needs a data repo (see "Repo split" above) before its MCP server has

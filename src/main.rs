@@ -22,6 +22,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     match args.next() {
         Some(subcommand) if subcommand == "init" => run_init(&args.collect::<Vec<_>>()),
+        Some(flag) if flag == "--version" || flag == "-V" => println!("{}", version_line()),
         Some(other) => {
             eprintln!("husmo: unknown argument '{other}'");
             std::process::exit(1);
@@ -32,6 +33,14 @@ fn main() {
             runtime.block_on(serve());
         }
     }
+}
+
+/// The `husmo --version` / `husmo -V` output — matched against by the
+/// Homebrew formula's `test do` block (see `.github/workflows/release.yml`),
+/// so it must stay a single line starting with the binary name followed by
+/// its Cargo package version.
+fn version_line() -> String {
+    format!("husmo {}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Serves the MCP server over stdio for the lifetime of the process.
@@ -150,6 +159,14 @@ fn prompt_for_repo_url() -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn version_line_reports_the_binary_name_and_cargo_package_version() {
+        assert_eq!(
+            super::version_line(),
+            format!("husmo {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
     #[test]
     fn parse_init_args_returns_none_when_no_flag_is_given() {
         assert_eq!(super::parse_init_args(&[]), Ok(None));

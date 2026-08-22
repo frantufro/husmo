@@ -3,10 +3,17 @@ name = "husmo"
 version = "0.1.0"
 edition = "2024"
 description = "Local-first, git-backed document/link database with a Rust MCP server"
+license = "MIT"
+repository = "https://github.com/frantufro/husmo"
+homepage = "https://github.com/frantufro/husmo"
 
 [[bin]]
 name = "husmo"
 path = "src/main.rs"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
