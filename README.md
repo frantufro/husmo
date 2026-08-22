@@ -38,6 +38,39 @@ Concretely:
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and
 [`CONTEXT.md`](CONTEXT.md) for the domain glossary.
 
+## Setup
+
+husmo needs a data repo (see "Repo split" above) before its MCP server has
+anywhere to save Documents. `husmo init` bootstraps one:
+
+```sh
+cd wherever/you/want/the/data/repo
+husmo init --repo git@github.com:you/husmo-data.git
+```
+
+`--repo` is optional; omitted, `husmo init` prompts for the URL
+interactively instead, for a scripted/non-interactive setup. `init`:
+
+1. Clones the given git URL into the current directory. Refuses to run if
+   that directory already exists and isn't empty, so it never clobbers
+   anything already there.
+2. Writes/updates the config file below to point `data_repo_path` at the
+   clone, so the MCP server has a working data repo location the moment
+   `init` finishes — no separate manual config-editing step.
+
+An empty git repo works too (`git init --bare` it somewhere first, or create
+one on your git host and skip pushing anything to it before cloning);
+`init` doesn't require the repo to already contain Documents.
+
+Once a data repo is configured, add husmo as an MCP server to whichever MCP
+client you use, pointed at the built `husmo` binary run with no arguments
+(`husmo` — not `husmo init`). It speaks the standard MCP stdio transport, so
+no extra wiring beyond what the client already does for any other stdio MCP
+server is needed. The first `save` or `search-semantic` call downloads the
+local embedding model's weights (see "Local-first" below) and caches them;
+every call after that, including in future runs, needs no network access
+for embeddings.
+
 ## Configuration
 
 husmo reads a TOML config file that points at the data repo:
@@ -46,7 +79,9 @@ husmo reads a TOML config file that points at the data repo:
 data_repo_path = "/path/to/your/husmo-data"
 ```
 
-It locates that file by checking, in order:
+`husmo init` writes this file for you (see "Setup" above); editing it by
+hand is only needed to point at a different data repo later. husmo locates
+the file by checking, in order:
 
 1. `HUSMO_CONFIG` — an explicit path to the config file.
 2. `$XDG_CONFIG_HOME/husmo/config.toml`.
@@ -54,10 +89,19 @@ It locates that file by checking, in order:
 
 ## Status
 
-Early scaffolding. The MCP server's tool surface (`save`, `get`,
-`search-semantic`, `search-tag`, `search-fulltext`, `relate`, `unrelate`,
-`list`, `delete`) is not implemented yet — see `docs/ARCHITECTURE.md` for
-what's planned.
+The full tool surface from `docs/ARCHITECTURE.md` is implemented: `save`,
+`get`, `search-semantic`, `search-tag`, `search-fulltext`, `relate`,
+`unrelate`, `list`, and `delete`, plus MCP resources (`resources/list` /
+`resources/read`) for browsing Documents directly. An end-to-end test
+(`tests/end_to_end_smoke_test.rs`) exercises the full story across them:
+saving a URL, discovering and archiving an outgoing link, relating the two
+Documents, retrieving the Related list, finding a Document by semantic
+search, and deleting it.
+
+Archiving a discovered outgoing link (`husmo::archive::archive_outgoing_link`)
+has no MCP tool of its own yet — deciding which discovered links are worth
+archiving is left to a Skill layered on top of this server, per
+`docs/ARCHITECTURE.md` ("Content extraction").
 
 ## Development
 
