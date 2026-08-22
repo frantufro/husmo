@@ -1,0 +1,10 @@
+{
+  "name": "husmo",
+  "description": "Save and retrieve documents/links through the husmo MCP server: save URLs, pasted text, and local files, triage outgoing links, search by meaning/tag/full-text, and relate documents in a graph.",
+  "version": "0.1.0",
+  "author": {"name": "Fran Tufro"},
+  "homepage": "https://github.com/frantufro/husmo",
+  "repository": "https://github.com/frantufro/husmo",
+  "license": "MIT",
+  "keywords": ["documents", "links", "mcp", "rag", "search", "git"]
+}
