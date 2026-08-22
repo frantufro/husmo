@@ -14,7 +14,7 @@ and fixed before being marked done.
 ## Milestone: Foundation & Ingestion
 - [✓] scaffold-husmo-rust-project — Scaffold husmo Rust project
 - [✓] document-model-and-file-i-o — Document model and file I/O
-- [ ] husmo-init-clone-data-repo-and-write-config — husmo init: clone data repo and write config
+- [✓] husmo-init-clone-data-repo-and-write-config — husmo init: clone data repo and write config
 - [✓] git-backed-persistence-wrapper — Git-backed persistence wrapper
 - [✓] url-ingestion-fetch-and-extraction — URL ingestion: fetch and extraction
 - [✓] image-handling-during-extraction — Image handling during extraction
@@ -27,12 +27,12 @@ and fixed before being marked done.
 - [✓] full-text-and-tag-search — Full-text and tag search
 - [✓] related-graph-relate-and-unrelate — Related graph: relate and unrelate
 - [✓] outgoing-link-archiving-flow — Outgoing-link archiving flow
-- [ ] replace-hash-based-embeddings-with-a-real-local-sentence-embedding-model — Replace hash-based embeddings with a real local sentence-embedding model
+- [✓] replace-hash-based-embeddings-with-a-real-local-sentence-embedding-model — Replace hash-based embeddings with a real local sentence-embedding model
 
 ## Milestone: MCP Server & Polish
 - [✓] mcp-server-scaffold-and-save-tool — MCP server scaffold and save tool
 - [✓] get-tool — get tool
-- [ ] search-semantic-search-tag-search-fulltext-tools — search-semantic, search-tag, search-fulltext tools
-- [ ] relate-unrelate-list-delete-tools — relate, unrelate, list, delete tools
-- [ ] mcp-resources-list-and-read-documents — MCP resources: list and read Documents
-- [ ] end-to-end-smoke-test-and-readme-finalization — End-to-end smoke test and README finalization
+- [✓] search-semantic-search-tag-search-fulltext-tools — search-semantic, search-tag, search-fulltext tools
+- [✓] relate-unrelate-list-delete-tools — relate, unrelate, list, delete tools
+- [✓] mcp-resources-list-and-read-documents — MCP resources: list and read Documents
+- [✓] end-to-end-smoke-test-and-readme-finalization — End-to-end smoke test and README finalization
