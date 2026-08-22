@@ -21,7 +21,7 @@ use crate::embeddings::{self, DocumentEmbeddings, EmbeddingsError};
 use crate::extract::OutgoingLink;
 use crate::fetch::FetchError;
 use crate::images::ImageError;
-use crate::local_file::{self, IngestError as LocalFileIngestError};
+use crate::local_file::{self, IngestError as LocalFileIngestError, PathPolicy};
 use crate::pasted_text;
 use crate::store::{self, StoreError};
 use crate::url_ingest::{UrlIngestError, fetch_and_build_document};
@@ -147,18 +147,26 @@ pub struct SaveOutput {
 /// ingestion path, applies `tags`, chunks and embeds the result, and writes
 /// both the Document and its chunk-embeddings sidecar. For the `Url` kind,
 /// re-saving the same `canonical_url` overwrites the existing Document in
-/// place (same `id`/`slug`) instead of creating a second one.
+/// place (same `id`/`slug`) instead of creating a second one. `path_policy`
+/// is only consulted for the `LocalFile` kind, gating which local paths
+/// `save` is allowed to read from (see [`local_file::validate_source_path`]).
 ///
 /// # Errors
 ///
 /// Returns [`SaveError::Fetch`]/[`SaveError::Image`] if a URL or one of its
-/// images can't be fetched, [`SaveError::LocalFile`] if a local file can't
-/// be ingested, or [`SaveError::Store`]/[`SaveError::Embeddings`] if writing
-/// the Document or its embeddings sidecar fails.
-pub fn save(dir: &Path, input: SaveInput, tags: Vec<String>) -> Result<SaveOutput, SaveError> {
+/// images can't be fetched, [`SaveError::LocalFile`] if a local file is
+/// rejected by `path_policy` or can't be ingested, or
+/// [`SaveError::Store`]/[`SaveError::Embeddings`] if writing the Document or
+/// its embeddings sidecar fails.
+pub fn save(
+    dir: &Path,
+    input: SaveInput,
+    tags: Vec<String>,
+    path_policy: &PathPolicy,
+) -> Result<SaveOutput, SaveError> {
     let (mut document, outgoing_links) = match input {
         SaveInput::Url(url) => save_url(dir, &url)?,
-        SaveInput::LocalFile(path) => (save_local_file(dir, &path)?, Vec::new()),
+        SaveInput::LocalFile(path) => (save_local_file(dir, &path, path_policy)?, Vec::new()),
         SaveInput::PastedText { title, content } => {
             (pasted_text::ingest(title, content), Vec::new())
         }
@@ -185,13 +193,17 @@ fn save_url(dir: &Path, url: &str) -> Result<(Document, Vec<OutgoingLink>), Save
     Ok(fetch_and_build_document(dir, url, url)?)
 }
 
-/// The `LocalFile` branch of [`save`]: ingests `path`'s content (see
-/// `crate::local_file`) and titles the new Document after the file's stem
-/// (the filename without its extension). There is no `canonical_url` and no
-/// extraction step for a local file, so re-saving the same path always
-/// creates a new Document rather than overwriting one in place.
-fn save_local_file(dir: &Path, path: &Path) -> Result<Document, SaveError> {
-    let content = local_file::ingest(path)?;
+/// The `LocalFile` branch of [`save`]: validates `path` against
+/// `path_policy` (see `crate::local_file::validate_source_path`), ingests
+/// its content (see `crate::local_file::ingest`), and titles the new
+/// Document after the file's stem (the filename without its extension).
+/// There is no `canonical_url` and no extraction step for a local file, so
+/// re-saving the same path always creates a new Document rather than
+/// overwriting one in place.
+fn save_local_file(dir: &Path, path: &Path, path_policy: &PathPolicy) -> Result<Document, SaveError> {
+    let canonical_path =
+        local_file::validate_source_path(path, path_policy).map_err(LocalFileIngestError::from)?;
+    let content = local_file::ingest(&canonical_path)?;
     let title = path.file_stem().map_or_else(
         || path.to_string_lossy().into_owned(),
         |stem| stem.to_string_lossy().into_owned(),
@@ -287,7 +299,8 @@ mod tests {
             content: "Some pasted content.".to_string(),
         };
 
-        let output = save(dir.path(), input, Vec::new()).expect("save should succeed");
+        let output = save(dir.path(), input, Vec::new(), &PathPolicy::default())
+            .expect("save should succeed");
 
         assert_eq!(output.document.title, "My Pasted Note");
         assert_eq!(output.document.content, "Some pasted content.");
@@ -314,6 +327,7 @@ mod tests {
             dir.path(),
             input,
             vec!["rust".to_string(), "notes".to_string()],
+            &PathPolicy::default(),
         )
         .expect("save should succeed");
 
@@ -328,7 +342,8 @@ mod tests {
             content: "First paragraph.\n\nSecond paragraph.".to_string(),
         };
 
-        let output = save(dir.path(), input, Vec::new()).expect("save should succeed");
+        let output = save(dir.path(), input, Vec::new(), &PathPolicy::default())
+            .expect("save should succeed");
 
         let sidecar = crate::embeddings::read(&crate::embeddings::sidecar_path(
             dir.path(),
@@ -346,12 +361,42 @@ mod tests {
         std::fs::write(&file_path, "Some file content.\n").expect("failed to write test file");
         let input = SaveInput::LocalFile(file_path);
 
-        let output = save(dir.path(), input, Vec::new()).expect("save should succeed");
+        let output = save(dir.path(), input, Vec::new(), &PathPolicy::default())
+            .expect("save should succeed");
 
         assert_eq!(output.document.content, "Some file content.\n");
         assert_eq!(output.document.canonical_url, None);
         assert_eq!(output.document.title, "notes");
         assert!(output.outgoing_links.is_empty());
+    }
+
+    #[test]
+    fn save_rejects_a_local_file_outside_the_configured_allowed_source_dirs() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let outside_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let file_path = outside_dir.path().join("secret.txt");
+        std::fs::write(&file_path, "top secret").expect("failed to write test file");
+        let policy = PathPolicy {
+            allowed_source_dirs: Some(vec![dir.path().to_path_buf()]),
+            home: None,
+        };
+
+        let result = save(dir.path(), SaveInput::LocalFile(file_path), Vec::new(), &policy);
+
+        assert!(
+            matches!(
+                result,
+                Err(SaveError::LocalFile(LocalFileIngestError::PathRestriction(
+                    crate::local_file::PathRestrictionError::OutsideAllowedDirs { .. }
+                )))
+            ),
+            "expected a PathRestriction/OutsideAllowedDirs error, got {result:?}"
+        );
+        let on_disk = crate::store::load_all(dir.path()).expect("load_all should succeed");
+        assert!(
+            on_disk.is_empty(),
+            "no Document should have been written for a rejected path"
+        );
     }
 
     /// Starts a one-shot HTTP server on an OS-assigned localhost port that
@@ -420,6 +465,7 @@ mod tests {
             tempfile::tempdir().expect("failed to create temp dir").path(),
             SaveInput::Url(url.clone()),
             Vec::new(),
+            &PathPolicy::default(),
         )
         .expect("save should succeed");
 
@@ -444,9 +490,9 @@ mod tests {
         );
         let dir = tempfile::tempdir().expect("failed to create temp dir");
 
-        let first = save(dir.path(), SaveInput::Url(url.clone()), Vec::new())
+        let first = save(dir.path(), SaveInput::Url(url.clone()), Vec::new(), &PathPolicy::default())
             .expect("first save should succeed");
-        let second = save(dir.path(), SaveInput::Url(url.clone()), Vec::new())
+        let second = save(dir.path(), SaveInput::Url(url.clone()), Vec::new(), &PathPolicy::default())
             .expect("second save should succeed");
 
         assert_eq!(second.document.id, first.document.id);
@@ -471,14 +517,14 @@ mod tests {
         );
         let dir = tempfile::tempdir().expect("failed to create temp dir");
 
-        let first = save(dir.path(), SaveInput::Url(url.clone()), Vec::new())
+        let first = save(dir.path(), SaveInput::Url(url.clone()), Vec::new(), &PathPolicy::default())
             .expect("first save should succeed");
         let other = Document::new("Other Document", "other content");
         crate::store::write(dir.path(), &other).expect("write should succeed");
         crate::related::relate(dir.path(), &first.document.id, &other.id)
             .expect("relate should succeed");
 
-        let second = save(dir.path(), SaveInput::Url(url), Vec::new())
+        let second = save(dir.path(), SaveInput::Url(url), Vec::new(), &PathPolicy::default())
             .expect("second save should succeed");
 
         assert_eq!(

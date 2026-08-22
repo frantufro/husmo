@@ -18,6 +18,7 @@ use std::io::Write as _;
 
 use clap::{Parser, Subcommand};
 use husmo::config;
+use husmo::local_file::PathPolicy;
 use husmo::mcp_server::HusmoServer;
 use rmcp::ServiceExt;
 use rmcp::transport::io::stdio;
@@ -73,7 +74,11 @@ async fn serve() {
         }
     };
 
-    let server = HusmoServer::new(cfg.data_repo_path);
+    let path_policy = PathPolicy {
+        allowed_source_dirs: cfg.allowed_source_dirs,
+        home: std::env::var("HOME").ok().map(std::path::PathBuf::from),
+    };
+    let server = HusmoServer::new(cfg.data_repo_path, path_policy);
     let running = match server.serve(stdio()).await {
         Ok(running) => running,
         Err(err) => {

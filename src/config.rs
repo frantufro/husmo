@@ -17,6 +17,15 @@ pub struct Config {
     /// Filesystem path to the data repo (the git-tracked store of
     /// Documents).
     pub data_repo_path: PathBuf,
+    /// Root directories the `save` tool's local-file (`path`) ingestion is
+    /// allowed to read from. When set, a `save` call with a `path` outside
+    /// every configured root (after canonicalizing) is rejected — see
+    /// `crate::local_file::PathPolicy`. When unset (the default), `save`
+    /// still refuses well-known secret-bearing directories (`~/.ssh`,
+    /// `~/.aws`, `~/.gnupg`, `~/.config`) rather than allowing every path on
+    /// disk unconditionally.
+    #[serde(default)]
+    pub allowed_source_dirs: Option<Vec<PathBuf>>,
 }
 
 /// An error encountered while locating or parsing a config file.
@@ -30,7 +39,7 @@ pub enum ConfigError {
         path: PathBuf,
     },
     /// The file exists but could not be read.
-    #[error("failed to read config file at {}", path.display())]
+    #[error("failed to read config file at {}: {source}", path.display())]
     Read {
         /// The path that was read.
         path: PathBuf,
@@ -39,7 +48,7 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     /// The file was read but its contents are not valid config TOML.
-    #[error("failed to parse config file at {}", path.display())]
+    #[error("failed to parse config file at {}: {source}", path.display())]
     Parse {
         /// The path that was parsed.
         path: PathBuf,

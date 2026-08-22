@@ -3,12 +3,22 @@
 //! `reqwest` GET. This module's job ends at "here is the raw HTML that came
 //! back"; turning that into Markdown is [`crate::extract`]'s job.
 
+use std::io::Read as _;
+
+/// The maximum response body [`fetch`]/[`fetch_bytes`] will buffer into
+/// memory, in bytes, before giving up. Without this, a malicious or
+/// misbehaving server (or a URL saved via the `save` tool pointing at one)
+/// could exhaust memory with an unbounded — or deliberately huge — response
+/// body; 20 MiB comfortably covers any real HTML page or embedded image
+/// this tool is meant to save.
+const MAX_RESPONSE_BYTES: u64 = 20 * 1024 * 1024;
+
 /// An error encountered while fetching a URL.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FetchError {
     /// The HTTP request itself failed (DNS, connection, TLS, timeout...).
-    #[error("failed to fetch {url}")]
+    #[error("failed to fetch {url}: {source}")]
     Request {
         /// The URL that was requested.
         url: String,
@@ -25,55 +35,66 @@ pub enum FetchError {
         status: reqwest::StatusCode,
     },
     /// The response body could not be read.
-    #[error("failed to read the response body from {url}")]
+    #[error("failed to read the response body from {url}: {source}")]
     Body {
         /// The URL that was requested.
         url: String,
-        /// The underlying `reqwest` failure.
+        /// The underlying I/O failure.
         #[source]
-        source: reqwest::Error,
+        source: std::io::Error,
+    },
+    /// The response body exceeded the size limit.
+    #[error("response body from {url} exceeded the {limit}-byte limit")]
+    TooLarge {
+        /// The URL that was requested.
+        url: String,
+        /// The limit that was exceeded.
+        limit: u64,
     },
 }
 
 /// Fetches `url` over plain HTTP(S) — no headless browser, no JS rendering,
 /// per `docs/ARCHITECTURE.md` ("Content extraction") — and returns the
-/// response body as text.
+/// response body as text, reading at most [`MAX_RESPONSE_BYTES`] of it.
+///
+/// Bytes that aren't valid UTF-8 are replaced with the placeholder
+/// character rather than failing the fetch outright — this reads the raw
+/// response body directly (to enforce the size cap on the byte stream),
+/// bypassing `reqwest`'s own charset-aware text decoding, so a page served
+/// in a non-UTF-8 encoding may come through with the placeholder character
+/// in place of extended characters; the vast majority of pages are UTF-8.
 ///
 /// # Errors
 ///
 /// Returns [`FetchError::Request`] if the request fails outright,
 /// [`FetchError::Status`] if the server responds with a non-success status,
-/// or [`FetchError::Body`] if the response body can't be read.
+/// [`FetchError::Body`] if the response body can't be read, or
+/// [`FetchError::TooLarge`] if it exceeds the size limit.
 pub fn fetch(url: &str) -> Result<String, FetchError> {
-    let response = reqwest::blocking::get(url).map_err(|source| FetchError::Request {
-        url: url.to_string(),
-        source,
-    })?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(FetchError::Status {
-            url: url.to_string(),
-            status,
-        });
-    }
-
-    response.text().map_err(|source| FetchError::Body {
-        url: url.to_string(),
-        source,
-    })
+    let bytes = fetch_bytes_capped(url, MAX_RESPONSE_BYTES)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Fetches `url` over plain HTTP(S) the same way [`fetch`] does, but returns
 /// the raw response body bytes instead of decoding it as text — used for
-/// binary content such as images (see `crate::images`).
+/// binary content such as images (see `crate::images`). Reads at most
+/// [`MAX_RESPONSE_BYTES`] of it.
 ///
 /// # Errors
 ///
 /// Returns [`FetchError::Request`] if the request fails outright,
 /// [`FetchError::Status`] if the server responds with a non-success status,
-/// or [`FetchError::Body`] if the response body can't be read.
+/// [`FetchError::Body`] if the response body can't be read, or
+/// [`FetchError::TooLarge`] if it exceeds the size limit.
 pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, FetchError> {
+    fetch_bytes_capped(url, MAX_RESPONSE_BYTES)
+}
+
+/// Does the actual work behind [`fetch`]/[`fetch_bytes`], capped at
+/// `max_bytes` rather than the fixed [`MAX_RESPONSE_BYTES`] — kept
+/// `pub(crate)` and parameterized so tests can exercise the cap itself
+/// without downloading tens of megabytes.
+pub(crate) fn fetch_bytes_capped(url: &str, max_bytes: u64) -> Result<Vec<u8>, FetchError> {
     let response = reqwest::blocking::get(url).map_err(|source| FetchError::Request {
         url: url.to_string(),
         source,
@@ -87,11 +108,27 @@ pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, FetchError> {
         });
     }
 
-    let bytes = response.bytes().map_err(|source| FetchError::Body {
-        url: url.to_string(),
-        source,
-    })?;
-    Ok(bytes.to_vec())
+    // Read one byte past the limit: that lets us tell "exactly at the
+    // limit" apart from "over it" by checking the length afterward,
+    // without trusting a `Content-Length` header a server could lie about
+    // or omit.
+    let mut buf = Vec::new();
+    response
+        .take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|source| FetchError::Body {
+            url: url.to_string(),
+            source,
+        })?;
+
+    if u64::try_from(buf.len()).is_ok_and(|len| len > max_bytes) {
+        return Err(FetchError::TooLarge {
+            url: url.to_string(),
+            limit: max_bytes,
+        });
+    }
+
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -207,5 +244,37 @@ mod tests {
         let result = fetch_bytes(&url);
 
         assert!(matches!(result, Err(FetchError::Status { .. })));
+    }
+
+    #[test]
+    fn fetch_bytes_capped_reports_too_large_when_the_body_exceeds_the_cap() {
+        let url = one_shot_server(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/plain\r\n\
+             Content-Length: 13\r\n\
+             Connection: close\r\n\
+             \r\n\
+             <p>hello</p>\n",
+        );
+
+        let result = fetch_bytes_capped(&url, 5);
+
+        assert!(matches!(result, Err(FetchError::TooLarge { limit: 5, .. })));
+    }
+
+    #[test]
+    fn fetch_bytes_capped_succeeds_when_the_body_is_exactly_at_the_cap() {
+        let url = one_shot_server(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/plain\r\n\
+             Content-Length: 13\r\n\
+             Connection: close\r\n\
+             \r\n\
+             <p>hello</p>\n",
+        );
+
+        let body = fetch_bytes_capped(&url, 13).expect("fetch_bytes_capped should succeed");
+
+        assert_eq!(body, b"<p>hello</p>\n");
     }
 }

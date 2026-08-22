@@ -137,7 +137,10 @@ async fn call_tool(
 ) -> Result<rmcp::model::CallToolResult, rmcp::ServiceError> {
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
 
-    let server = husmo::mcp_server::HusmoServer::new(data_repo_path);
+    let server = husmo::mcp_server::HusmoServer::new(
+        data_repo_path,
+        husmo::local_file::PathPolicy::default(),
+    );
     let server_handle = tokio::spawn(async move {
         server
             .serve(server_transport)
@@ -243,7 +246,18 @@ async fn archive_step(data_repo_path: PathBuf, link: OutgoingLink, main_id: &str
     // builds (and tears down) its own inner Tokio runtime — doing that
     // directly from within an async task's own poll panics.
     let archived = tokio::task::spawn_blocking(move || {
-        husmo::archive::archive_outgoing_link(&data_repo_path, &link)
+        let result = husmo::archive::archive_outgoing_link(&data_repo_path, &link);
+        // `archive_outgoing_link` deliberately leaves the git pull/commit/
+        // push cycle to its caller (see `src/archive.rs`'s module doc) — a
+        // real caller wrapping this in `crate::git_sync::sync_write` would
+        // leave the working tree clean afterward, which the `relate` tool
+        // call below now requires (`sync_write` refuses to write onto an
+        // already-dirty tree), so commit here to mirror that.
+        if result.is_ok() {
+            let repo = git2::Repository::open(&data_repo_path).expect("failed to open repo");
+            commit_all(&repo, "archive: discovered link");
+        }
+        result
     })
     .await
     .expect("archiving task should not panic")

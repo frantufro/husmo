@@ -91,7 +91,7 @@ impl DocumentEmbeddings {
 #[non_exhaustive]
 pub enum EmbeddingsError {
     /// The sidecar file could not be written.
-    #[error("failed to write {}", path.display())]
+    #[error("failed to write {}: {source}", path.display())]
     Write {
         /// The path that was written.
         path: PathBuf,
@@ -100,7 +100,7 @@ pub enum EmbeddingsError {
         source: std::io::Error,
     },
     /// The sidecar file could not be read.
-    #[error("failed to read {}", path.display())]
+    #[error("failed to read {}: {source}", path.display())]
     Read {
         /// The path that was read.
         path: PathBuf,
@@ -109,7 +109,7 @@ pub enum EmbeddingsError {
         source: std::io::Error,
     },
     /// The sidecar file's contents didn't parse.
-    #[error("embeddings sidecar file at {} is malformed", path.display())]
+    #[error("embeddings sidecar file at {} is malformed: {source}", path.display())]
     Malformed {
         /// The path that was parsed.
         path: PathBuf,
@@ -118,7 +118,7 @@ pub enum EmbeddingsError {
         source: serde_norway::Error,
     },
     /// The sidecar file could not be removed.
-    #[error("failed to remove {}", path.display())]
+    #[error("failed to remove {}: {source}", path.display())]
     Remove {
         /// The path that was removed.
         path: PathBuf,
@@ -127,7 +127,7 @@ pub enum EmbeddingsError {
         source: std::io::Error,
     },
     /// A directory could not be listed.
-    #[error("failed to list directory {}", path.display())]
+    #[error("failed to list directory {}: {source}", path.display())]
     ListDir {
         /// The directory that was listed.
         path: PathBuf,

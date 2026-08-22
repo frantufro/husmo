@@ -69,11 +69,11 @@ fn model() -> Result<&'static Model, EmbedError> {
 #[non_exhaustive]
 pub enum LoadModelError {
     /// The Hugging Face Hub API client could not be created.
-    #[error("failed to create the Hugging Face Hub API client")]
+    #[error("failed to create the Hugging Face Hub API client: {0}")]
     HubClient(#[source] ApiError),
     /// One of the model's files could not be fetched or read from the
     /// local Hugging Face Hub cache.
-    #[error("failed to fetch/cache the embedding model's {file}")]
+    #[error("failed to fetch/cache the embedding model's {file}: {source}")]
     Fetch {
         /// The name of the file that was requested, e.g. `"config.json"`.
         file: &'static str,
@@ -82,23 +82,23 @@ pub enum LoadModelError {
         source: ApiError,
     },
     /// The model's `config.json` could not be read from disk.
-    #[error("failed to read the embedding model's config.json")]
+    #[error("failed to read the embedding model's config.json: {0}")]
     ReadConfig(#[source] std::io::Error),
     /// The model's `config.json` did not parse as the expected BERT
     /// config.
-    #[error("the embedding model's config.json did not parse as a BERT config")]
+    #[error("the embedding model's config.json did not parse as a BERT config: {0}")]
     ParseConfig(#[source] serde_json::Error),
     /// The model's `tokenizer.json` could not be loaded.
-    #[error("failed to load the embedding model's tokenizer.json")]
+    #[error("failed to load the embedding model's tokenizer.json: {0}")]
     LoadTokenizer(#[source] tokenizers::Error),
     /// The tokenizer's truncation settings could not be configured.
-    #[error("failed to configure the embedding model's tokenizer truncation")]
+    #[error("failed to configure the embedding model's tokenizer truncation: {0}")]
     ConfigureTruncation(#[source] tokenizers::Error),
     /// The model's weights could not be memory-mapped.
-    #[error("failed to memory-map the embedding model's weights")]
+    #[error("failed to memory-map the embedding model's weights: {0}")]
     MmapWeights(#[source] candle_core::Error),
     /// The BERT model could not be built from its config and weights.
-    #[error("failed to build the BERT model from weights")]
+    #[error("failed to build the BERT model from weights: {0}")]
     BuildModel(#[source] candle_core::Error),
 }
 
@@ -163,14 +163,14 @@ fn load_model() -> Result<Model, LoadModelError> {
 #[non_exhaustive]
 pub enum EmbedError {
     /// The process-wide model (see [`load_model`]) could not be built.
-    #[error("failed to load the embedding model")]
+    #[error("failed to load the embedding model: {0}")]
     Load(#[source] Arc<LoadModelError>),
     /// The input text could not be tokenized.
-    #[error("failed to tokenize text for embedding")]
+    #[error("failed to tokenize text for embedding: {0}")]
     Tokenize(#[source] tokenizers::Error),
     /// Running the tokenized text through the model failed — building an
     /// input tensor, the BERT forward pass, or pooling/reading its output.
-    #[error("embedding inference failed")]
+    #[error("embedding inference failed: {0}")]
     Inference(#[source] candle_core::Error),
 }
 

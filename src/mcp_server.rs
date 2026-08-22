@@ -12,6 +12,7 @@
 //! later roadmap tasks onto this same [`HusmoServer`].
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -32,6 +33,7 @@ use crate::embeddings::EmbeddingsError;
 use crate::extract::OutgoingLink;
 use crate::fulltext_search::{self, FullTextSearchHit};
 use crate::git_sync::{self, SyncError};
+use crate::local_file::PathPolicy;
 use crate::related::{self, RelateError};
 use crate::resources;
 use crate::save::{self, SaveError, SaveInput};
@@ -47,14 +49,30 @@ use crate::vector_index;
 #[derive(Debug, Clone)]
 pub struct HusmoServer {
     data_repo_path: PathBuf,
+    /// Governs which local files the `save` tool's `path` ingestion is
+    /// allowed to read from (see `crate::local_file::PathPolicy`).
+    path_policy: PathPolicy,
+    /// Serializes the write-tool handlers' git pull/commit/push cycles
+    /// (`save`, `delete`, `relate`/`unrelate`) against each other within
+    /// this server process, so two concurrent tool calls can't interleave
+    /// their pulls/commits/pushes against the same working tree. A plain
+    /// blocking `std::sync::Mutex`, not `tokio::sync::Mutex`: it's only
+    /// ever held inside a `tokio::task::spawn_blocking` closure, never
+    /// across an `.await` point.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl HusmoServer {
     /// Creates a server whose tools all operate against the data repo at
-    /// `data_repo_path`.
+    /// `data_repo_path`, with local-file ingestion governed by
+    /// `path_policy`.
     #[must_use]
-    pub fn new(data_repo_path: PathBuf) -> Self {
-        Self { data_repo_path }
+    pub fn new(data_repo_path: PathBuf, path_policy: PathPolicy) -> Self {
+        Self {
+            data_repo_path,
+            path_policy,
+            write_lock: Arc::new(Mutex::new(())),
+        }
     }
 }
 
@@ -379,6 +397,8 @@ impl HusmoServer {
         let message = commit_message(&input);
         let sync_dir = self.data_repo_path.clone();
         let save_dir = self.data_repo_path.clone();
+        let path_policy = self.path_policy.clone();
+        let write_lock = self.write_lock.clone();
         let tags = params.tags;
 
         // Ingesting a URL performs blocking network I/O, and the git
@@ -388,8 +408,11 @@ impl HusmoServer {
         // builds (and later tears down) its own inner Tokio runtime, which
         // panics if attempted from within an async task's own poll.
         let output = tokio::task::spawn_blocking(move || {
+            let _guard = write_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             git_sync::sync_write(&sync_dir, &message, move || {
-                save::save(&save_dir, input, tags)
+                save::save(&save_dir, input, tags, &path_policy)
             })
         })
         .await
@@ -589,8 +612,12 @@ impl HusmoServer {
         let message = format!("delete: {identifier:?}");
         let sync_dir = self.data_repo_path.clone();
         let delete_dir = self.data_repo_path.clone();
+        let write_lock = self.write_lock.clone();
 
         let deleted = tokio::task::spawn_blocking(move || {
+            let _guard = write_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             git_sync::sync_write(&sync_dir, &message, move || {
                 crate::delete::delete(&delete_dir, &identifier)
             })
@@ -675,10 +702,14 @@ impl HusmoServer {
         let message = format!("{verb}: {id_a} <-> {id_b}");
         let sync_dir = self.data_repo_path.clone();
         let write_dir = self.data_repo_path.clone();
+        let write_lock = self.write_lock.clone();
         let write_id_a = id_a.clone();
         let write_id_b = id_b.clone();
 
         tokio::task::spawn_blocking(move || {
+            let _guard = write_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             git_sync::sync_write(&sync_dir, &message, move || write(&write_dir, &write_id_a, &write_id_b))
         })
         .await
@@ -883,6 +914,7 @@ mod tests {
     use rmcp::model::CallToolRequestParams;
     use rmcp::{ClientHandler, ServiceExt, serde_json};
 
+    use crate::local_file::PathPolicy;
     use crate::mcp_server::HusmoServer;
 
     /// A minimal MCP client used only to drive `HusmoServer` in these
@@ -968,7 +1000,7 @@ mod tests {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ServiceError> {
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
 
-        let server = HusmoServer::new(data_repo_path);
+        let server = HusmoServer::new(data_repo_path, PathPolicy::default());
         let server_handle = tokio::spawn(async move {
             server
                 .serve(server_transport)
@@ -1030,8 +1062,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn save_tool_ingests_a_local_file_end_to_end() {
-        let (_remote_dir, local_dir, data_repo_path) = seeded_data_repo();
-        let file_path = local_dir.path().join("notes.txt");
+        let (_remote_dir, _local_dir, data_repo_path) = seeded_data_repo();
+        // The source file to ingest lives outside the data repo entirely —
+        // writing it inside the data repo's own working tree would leave
+        // that tree dirty before `save` ever runs, which `sync_write` now
+        // refuses to write onto.
+        let source_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let file_path = source_dir.path().join("notes.txt");
         std::fs::write(&file_path, "Some file content.\n").expect("failed to write test file");
 
         let result = call_save(
@@ -1182,6 +1219,35 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn save_tool_reports_the_underlying_io_error_for_a_missing_local_file() {
+        let (_remote_dir, _local_dir, data_repo_path) = seeded_data_repo();
+        let source_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let missing_path = source_dir.path().join("does-not-exist.txt");
+
+        let result = call_save(
+            data_repo_path,
+            serde_json::json!({ "path": missing_path.to_string_lossy() }),
+        )
+        .await;
+
+        let error = result.expect_err("saving a missing local file should fail");
+        let message = error.to_string();
+        // The reported message should carry the full error chain down to
+        // the underlying `io::Error` — not just the outermost "write
+        // failed" wrapper — so a client (or a human reading logs) can see
+        // *why* the read failed without needing a debugger.
+        assert!(
+            message.contains(&missing_path.display().to_string()),
+            "expected the missing path to appear in the error chain, got {message:?}"
+        );
+        assert!(
+            message.to_lowercase().contains("no such file")
+                || message.to_lowercase().contains("cannot find the file"),
+            "expected the underlying io::Error's text to appear in the error chain, got {message:?}"
+        );
+    }
+
     /// Serves a fresh `HusmoServer` rooted at `data_repo_path` and calls its
     /// `get` tool with `arguments`, over a real (in-memory) MCP
     /// client/server connection. `get` is a read-only lookup, so unlike
@@ -1193,7 +1259,7 @@ mod tests {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ServiceError> {
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
 
-        let server = HusmoServer::new(data_repo_path);
+        let server = HusmoServer::new(data_repo_path, PathPolicy::default());
         let server_handle = tokio::spawn(async move {
             server
                 .serve(server_transport)
@@ -1338,7 +1404,7 @@ mod tests {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ServiceError> {
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
 
-        let server = HusmoServer::new(data_repo_path);
+        let server = HusmoServer::new(data_repo_path, PathPolicy::default());
         let server_handle = tokio::spawn(async move {
             server
                 .serve(server_transport)
@@ -1505,7 +1571,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
 
-        let server = HusmoServer::new(dir.path().to_path_buf());
+        let server = HusmoServer::new(dir.path().to_path_buf(), PathPolicy::default());
         let server_handle = tokio::spawn(async move {
             server
                 .serve(server_transport)
@@ -1568,6 +1634,12 @@ mod tests {
         let doc_b = crate::document::Document::new("B", "content b");
         crate::store::write(&data_repo_path, &doc_a).expect("write should succeed");
         crate::store::write(&data_repo_path, &doc_b).expect("write should succeed");
+        // Committed up front, the same way a prior `save` call would have
+        // left them — `sync_write` now refuses to write onto an already
+        // dirty working tree, so these need to be in HEAD before `relate`
+        // runs.
+        let repo = git2::Repository::open(&data_repo_path).expect("failed to open repo");
+        commit_all(&repo, "save: A, B");
 
         let structured = call_tool(
             data_repo_path.clone(),
@@ -1640,6 +1712,11 @@ mod tests {
         let (_remote_dir, _local_dir, data_repo_path) = seeded_data_repo();
         let doc_a = crate::document::Document::new("A", "content a");
         crate::store::write(&data_repo_path, &doc_a).expect("write should succeed");
+        // Committed up front so this exercises the "unknown id" failure
+        // inside `relate` itself, not `sync_write`'s unrelated dirty-tree
+        // check.
+        let repo = git2::Repository::open(&data_repo_path).expect("failed to open repo");
+        commit_all(&repo, "save: A");
 
         let result = call_tool(
             data_repo_path,
@@ -1662,6 +1739,12 @@ mod tests {
         crate::store::write(&data_repo_path, &doc_a).expect("write should succeed");
         crate::store::write(&data_repo_path, &doc_b).expect("write should succeed");
         crate::related::relate(&data_repo_path, &doc_a.id, &doc_b.id).expect("relate should succeed");
+        // Committed up front, the same way a prior `save`/`relate` call
+        // would have left them — `sync_write` now refuses to write onto an
+        // already dirty working tree, so these need to be in HEAD before
+        // `unrelate` runs.
+        let repo = git2::Repository::open(&data_repo_path).expect("failed to open repo");
+        commit_all(&repo, "save and relate: A, B");
 
         let structured = call_tool(
             data_repo_path.clone(),
@@ -1759,7 +1842,7 @@ mod tests {
     ) {
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
 
-        let server = HusmoServer::new(data_repo_path);
+        let server = HusmoServer::new(data_repo_path, PathPolicy::default());
         let server_handle = tokio::spawn(async move {
             server
                 .serve(server_transport)

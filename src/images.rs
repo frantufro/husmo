@@ -18,7 +18,7 @@ use crate::fetch::{self, FetchError};
 #[non_exhaustive]
 pub enum ImageError {
     /// Downloading an image's bytes failed.
-    #[error("failed to download image from {url}")]
+    #[error("failed to download image from {url}: {source}")]
     Fetch {
         /// The image URL that was requested.
         url: String,
@@ -27,7 +27,7 @@ pub enum ImageError {
         source: FetchError,
     },
     /// Writing the downloaded bytes to disk failed.
-    #[error("failed to write image to {}", path.display())]
+    #[error("failed to write image to {}: {source}", path.display())]
     Write {
         /// The path that was written.
         path: PathBuf,

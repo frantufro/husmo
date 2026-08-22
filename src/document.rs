@@ -156,7 +156,7 @@ pub enum DocumentParseError {
     #[error("document is missing the closing \"---\" frontmatter delimiter")]
     MissingClosingDelimiter,
     /// The frontmatter block isn't valid YAML matching the expected shape.
-    #[error("document frontmatter is not valid YAML")]
+    #[error("document frontmatter is not valid YAML: {0}")]
     Yaml(#[source] serde_norway::Error),
 }
 

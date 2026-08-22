@@ -19,7 +19,7 @@ const EXTENSION: &str = "md";
 #[non_exhaustive]
 pub enum StoreError {
     /// A file could not be read.
-    #[error("failed to read {}", path.display())]
+    #[error("failed to read {}: {source}", path.display())]
     Read {
         /// The path that was read.
         path: PathBuf,
@@ -28,7 +28,7 @@ pub enum StoreError {
         source: std::io::Error,
     },
     /// A file could not be written.
-    #[error("failed to write {}", path.display())]
+    #[error("failed to write {}: {source}", path.display())]
     Write {
         /// The path that was written.
         path: PathBuf,
@@ -37,7 +37,7 @@ pub enum StoreError {
         source: std::io::Error,
     },
     /// A file could not be removed.
-    #[error("failed to remove {}", path.display())]
+    #[error("failed to remove {}: {source}", path.display())]
     Remove {
         /// The path that was removed.
         path: PathBuf,
@@ -46,7 +46,7 @@ pub enum StoreError {
         source: std::io::Error,
     },
     /// A directory could not be listed.
-    #[error("failed to list directory {}", path.display())]
+    #[error("failed to list directory {}: {source}", path.display())]
     ListDir {
         /// The directory that was listed.
         path: PathBuf,
@@ -55,13 +55,21 @@ pub enum StoreError {
         source: std::io::Error,
     },
     /// A Document file's contents didn't parse.
-    #[error("document at {} is malformed", path.display())]
+    #[error("document at {} is malformed: {source}", path.display())]
     Malformed {
         /// The path that was parsed.
         path: PathBuf,
         /// The underlying parse failure.
         #[source]
         source: DocumentParseError,
+    },
+    /// A slug wasn't safe to use as a single filename component (a path
+    /// separator, or a special component like `.`/`..`) — see
+    /// [`is_bare_filename_component`].
+    #[error("{slug:?} is not a valid slug: it must be a single filename component")]
+    InvalidSlug {
+        /// The slug that was rejected.
+        slug: String,
     },
 }
 
@@ -70,8 +78,16 @@ pub enum StoreError {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Write`] if the file can't be written.
+/// Returns [`StoreError::InvalidSlug`] if `doc.slug` isn't a single bare
+/// filename component (see [`is_bare_filename_component`]), or
+/// [`StoreError::Write`] if the file can't be written.
 pub fn write(dir: &Path, doc: &Document) -> Result<PathBuf, StoreError> {
+    if !is_bare_filename_component(&doc.slug) {
+        return Err(StoreError::InvalidSlug {
+            slug: doc.slug.clone(),
+        });
+    }
+
     let path = dir.join(format!("{}.{EXTENSION}", doc.slug));
     std::fs::write(&path, doc.to_markdown()).map_err(|source| StoreError::Write {
         path: path.clone(),
@@ -84,9 +100,17 @@ pub fn write(dir: &Path, doc: &Document) -> Result<PathBuf, StoreError> {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Remove`] if the file can't be removed, including
-/// if it doesn't exist.
+/// Returns [`StoreError::InvalidSlug`] if `slug` isn't a single bare
+/// filename component (see [`is_bare_filename_component`]), or
+/// [`StoreError::Remove`] if the file can't be removed, including if it
+/// doesn't exist.
 pub fn remove(dir: &Path, slug: &str) -> Result<(), StoreError> {
+    if !is_bare_filename_component(slug) {
+        return Err(StoreError::InvalidSlug {
+            slug: slug.to_string(),
+        });
+    }
+
     let path = dir.join(format!("{slug}.{EXTENSION}"));
     std::fs::remove_file(&path).map_err(|source| StoreError::Remove { path, source })
 }
@@ -356,6 +380,17 @@ mod tests {
     }
 
     #[test]
+    fn write_rejects_a_slug_that_would_traverse_outside_the_directory() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let mut doc = Document::new("My Title", "content\n");
+        doc.slug = "../escape".to_string();
+
+        let result = write(dir.path(), &doc);
+
+        assert!(matches!(result, Err(StoreError::InvalidSlug { .. })));
+    }
+
+    #[test]
     fn load_all_reads_every_document_file_in_a_directory() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let one = Document::new("One", "first\n");
@@ -390,6 +425,15 @@ mod tests {
         let result = remove(dir.path(), "does-not-exist");
 
         assert!(matches!(result, Err(StoreError::Remove { .. })));
+    }
+
+    #[test]
+    fn remove_rejects_a_slug_that_would_traverse_outside_the_directory() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let result = remove(dir.path(), "../escape");
+
+        assert!(matches!(result, Err(StoreError::InvalidSlug { .. })));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::config::Config;
 #[non_exhaustive]
 pub enum InitError {
     /// Prompting the user interactively for the URL failed.
-    #[error("failed to read the data repo URL from stdin")]
+    #[error("failed to read the data repo URL from stdin: {0}")]
     Prompt(#[source] io::Error),
     /// `dest_dir` already exists and has files in it — refusing to clone
     /// into it and risk clobbering whatever is already there.
@@ -26,7 +26,7 @@ pub enum InitError {
         path: PathBuf,
     },
     /// Checking whether `dest_dir` is empty failed.
-    #[error("failed to check whether {} is empty", path.display())]
+    #[error("failed to check whether {} is empty: {source}", path.display())]
     ReadDestination {
         /// The directory that could not be read.
         path: PathBuf,
@@ -35,9 +35,18 @@ pub enum InitError {
         source: io::Error,
     },
     /// Cloning the data repo failed.
-    #[error("failed to clone {url} into {}", dest.display())]
+    ///
+    /// `url` has already had any embedded credentials redacted (see
+    /// [`crate::git_sync::scrub_credentials`]) — it's safe to display or log
+    /// as-is.
+    #[error(
+        "failed to clone {url} into {}: {}",
+        dest.display(),
+        crate::git_sync::scrub_credentials(&source.to_string())
+    )]
     Clone {
-        /// The git URL that was cloned.
+        /// The git URL that was cloned, with any embedded credentials
+        /// already redacted.
         url: String,
         /// The destination directory the clone was attempted into.
         dest: PathBuf,
@@ -46,10 +55,10 @@ pub enum InitError {
         source: git2::Error,
     },
     /// Serializing the config to TOML failed.
-    #[error("failed to serialize config")]
+    #[error("failed to serialize config: {0}")]
     SerializeConfig(#[source] toml::ser::Error),
     /// Creating the config file's parent directory failed.
-    #[error("failed to create config directory {}", path.display())]
+    #[error("failed to create config directory {}: {source}", path.display())]
     CreateConfigDir {
         /// The directory that could not be created.
         path: PathBuf,
@@ -58,7 +67,7 @@ pub enum InitError {
         source: io::Error,
     },
     /// Writing the config file failed.
-    #[error("failed to write config file at {}", path.display())]
+    #[error("failed to write config file at {}: {source}", path.display())]
     WriteConfig {
         /// The path that was written.
         path: PathBuf,
@@ -106,7 +115,7 @@ pub fn run(repo_url: &str, dest_dir: &Path, config_path: &Path) -> Result<(), In
         .fetch_options(fetch_options)
         .clone(repo_url, dest_dir)
         .map_err(|source| InitError::Clone {
-            url: repo_url.to_string(),
+            url: crate::git_sync::scrub_credentials(repo_url),
             dest: dest_dir.to_path_buf(),
             source,
         })?;
@@ -147,6 +156,7 @@ fn write_config(config_path: &Path, data_repo_path: &Path) -> Result<(), InitErr
 
     let config = Config {
         data_repo_path: data_repo_path.to_path_buf(),
+        allowed_source_dirs: None,
     };
     let contents = toml::to_string(&config).map_err(InitError::SerializeConfig)?;
 
@@ -214,6 +224,37 @@ mod tests {
             !config_path.exists(),
             "no config should be written when the clone is refused"
         );
+    }
+
+    #[test]
+    fn run_scrubs_credentials_from_the_url_in_a_clone_error() {
+        let dest_parent = tempfile::tempdir().expect("failed to create temp dir");
+        let dest_dir = dest_parent.path().join("husmo-data");
+        let config_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let config_path = config_dir.path().join("husmo/config.toml");
+
+        // Nothing is listening on this port, so the clone fails outright —
+        // enough to exercise `InitError::Clone`'s `url` field without a real
+        // remote or any network dependency.
+        let result = super::run(
+            "https://user:s3cr3t@127.0.0.1:1/no-such-repo.git",
+            &dest_dir,
+            &config_path,
+        );
+
+        match result {
+            Err(super::InitError::Clone { url, .. }) => {
+                assert!(
+                    !url.contains("s3cr3t"),
+                    "expected the credential to be scrubbed from {url:?}"
+                );
+                assert!(
+                    url.contains("[redacted]@"),
+                    "expected a redaction marker in {url:?}"
+                );
+            }
+            other => panic!("expected InitError::Clone, got {other:?}"),
+        }
     }
 
     #[test]

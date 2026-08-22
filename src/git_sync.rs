@@ -19,7 +19,7 @@ const REMOTE_NAME: &str = "origin";
 #[non_exhaustive]
 pub enum SyncError<E> {
     /// The repository at the given path could not be opened.
-    #[error("failed to open git repository at {}", path.display())]
+    #[error("failed to open git repository at {}: {}", path.display(), scrub_credentials(&source.to_string()))]
     Open {
         /// The path that was opened.
         path: PathBuf,
@@ -28,18 +28,67 @@ pub enum SyncError<E> {
         source: git2::Error,
     },
     /// Pulling from the remote before the write failed.
-    #[error("failed to pull from remote before write")]
-    Pull(#[source] git2::Error),
+    #[error("failed to pull from remote before write: {}", scrub_credentials(&source.to_string()))]
+    Pull {
+        /// The underlying git failure.
+        #[source]
+        source: git2::Error,
+    },
+    /// Checking the working tree's cleanliness before write failed.
+    #[error(
+        "failed to check the working tree's cleanliness before write: {}",
+        scrub_credentials(&source.to_string())
+    )]
+    CheckClean {
+        /// The underlying git failure.
+        #[source]
+        source: git2::Error,
+    },
+    /// The working tree already had uncommitted changes before `write` ran
+    /// — left by something outside this process (a manual edit, a crashed
+    /// prior run) rather than by `write` itself, since `write` hasn't been
+    /// called yet at this point in the cycle. Refusing rather than folding
+    /// those changes into this call's commit, which would silently attribute
+    /// them to an unrelated commit message.
+    #[error(
+        "refusing to write: the working tree already has uncommitted changes ({})",
+        paths.join(", ")
+    )]
+    DirtyWorkingTree {
+        /// The paths `git status` reported as dirty.
+        paths: Vec<String>,
+    },
     /// The write closure itself returned an error. No commit or push is
     /// attempted in this case.
-    #[error("write failed")]
+    #[error("write failed: {0}")]
     Write(#[source] E),
     /// Committing the write failed.
-    #[error("failed to commit write")]
-    Commit(#[source] git2::Error),
-    /// Pushing the commit to the remote failed.
-    #[error("failed to push to remote after commit")]
-    Push(#[source] git2::Error),
+    #[error("failed to commit write: {}", scrub_credentials(&source.to_string()))]
+    Commit {
+        /// The underlying git failure.
+        #[source]
+        source: git2::Error,
+    },
+    /// Pushing the commit to the remote failed (a transport/auth failure,
+    /// distinct from [`SyncError::PushRejected`], where the push reached the
+    /// remote but the remote refused the ref update).
+    #[error("failed to push to remote after commit: {}", scrub_credentials(&source.to_string()))]
+    Push {
+        /// The underlying git failure.
+        #[source]
+        source: git2::Error,
+    },
+    /// The remote reached the push but rejected updating `refname` — most
+    /// commonly because another writer pushed in the window between this
+    /// call's own pull and its push, so the remote has moved again and a
+    /// fast-forward is no longer possible.
+    #[error("remote rejected updating {refname}: {message}")]
+    PushRejected {
+        /// The ref the remote refused to update.
+        refname: String,
+        /// The rejection reason the remote reported.
+        message: String,
+    },
 }
 
 /// Runs `write` wrapped in the git pull -> write -> commit -> push cycle
@@ -67,15 +116,75 @@ pub fn sync_write<T, E>(
         source,
     })?;
 
-    pull(&repo).map_err(SyncError::Pull)?;
+    pull(&repo).map_err(|source| SyncError::Pull { source })?;
+
+    match ensure_clean(&repo) {
+        Ok(()) => {}
+        Err(CleanlinessError::Check(source)) => return Err(SyncError::CheckClean { source }),
+        Err(CleanlinessError::Dirty(paths)) => return Err(SyncError::DirtyWorkingTree { paths }),
+    }
 
     let result = write().map_err(SyncError::Write)?;
 
-    if let CommitOutcome::Committed = commit_all(&repo, message).map_err(SyncError::Commit)? {
-        push(&repo).map_err(SyncError::Push)?;
+    if let CommitOutcome::Committed = commit_all(&repo, message).map_err(|source| SyncError::Commit { source })? {
+        push(&repo).map_err(|failure| match failure {
+            PushFailure::Transport(source) => SyncError::Push { source },
+            PushFailure::Rejected { refname, message } => {
+                SyncError::PushRejected { refname, message }
+            }
+        })?;
     }
 
     Ok(result)
+}
+
+/// Redacts a `user:pass@`-style userinfo segment from any `scheme://...`
+/// URL embedded in `text`, so credentials baked into a remote URL never end
+/// up in a logged or MCP-surfaced error message. git2 error text can embed
+/// the remote URL verbatim (e.g. on an authentication failure), including
+/// any token/password it was configured with.
+pub(crate) fn scrub_credentials(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_at) = rest.find("://") {
+        result.push_str(&rest[..scheme_at + 3]);
+        rest = &rest[scheme_at + 3..];
+
+        // The userinfo segment, if present, ends at the last '@' before the
+        // next '/' or whitespace — a password could itself contain '@'.
+        let host_boundary = rest.find(['/', ' ', '\n', '\t']).unwrap_or(rest.len());
+        let authority = &rest[..host_boundary];
+        if let Some(at) = authority.rfind('@') {
+            result.push_str("[redacted]@");
+            rest = &rest[at + 1..];
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Checks that `repo`'s working tree has no uncommitted changes before a
+/// write is attempted. A crashed prior run or a manual edit could otherwise
+/// leave stray changes that [`commit_all`] would silently fold into this
+/// call's commit, misattributing them to an unrelated message.
+fn ensure_clean(repo: &Repository) -> Result<(), CleanlinessError> {
+    let statuses = repo.statuses(None).map_err(CleanlinessError::Check)?;
+    if statuses.is_empty() {
+        return Ok(());
+    }
+    let paths = statuses
+        .iter()
+        .filter_map(|entry| entry.path().ok().map(str::to_string))
+        .collect();
+    Err(CleanlinessError::Dirty(paths))
+}
+
+/// The two ways [`ensure_clean`] can fail.
+enum CleanlinessError {
+    /// Running `git status` itself failed.
+    Check(git2::Error),
+    /// The working tree has uncommitted changes.
+    Dirty(Vec<String>),
 }
 
 /// Whether [`commit_all`] produced a new commit or found nothing to commit.
@@ -185,14 +294,53 @@ fn commit_all(repo: &Repository, message: &str) -> Result<CommitOutcome, git2::E
     Ok(CommitOutcome::Committed)
 }
 
+/// The way [`push`] can fail: either the push itself (transport or auth)
+/// failed, or it reached the remote but the remote rejected updating the
+/// ref (most commonly a non-fast-forward, caught here instead of surfacing
+/// as a generic transport error).
+#[derive(Debug)]
+enum PushFailure {
+    /// The push transport or authentication failed.
+    Transport(git2::Error),
+    /// The remote reached the push but rejected the ref update.
+    Rejected {
+        /// The ref the remote refused to update.
+        refname: String,
+        /// The rejection reason the remote reported.
+        message: String,
+    },
+}
+
 /// Pushes the current branch to `origin`.
-fn push(repo: &Repository) -> Result<(), git2::Error> {
-    let mut remote = repo.find_remote(REMOTE_NAME)?;
+fn push(repo: &Repository) -> Result<(), PushFailure> {
+    let mut remote = repo
+        .find_remote(REMOTE_NAME)
+        .map_err(PushFailure::Transport)?;
+
+    let rejection: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    let mut callbacks = remote_callbacks(Some(repo));
+    callbacks.push_update_reference(|_refname, status| {
+        if let Some(message) = status {
+            *rejection.borrow_mut() = Some(message.to_string());
+        }
+        Ok(())
+    });
     let mut push_options = git2::PushOptions::new();
-    push_options.remote_callbacks(remote_callbacks(Some(repo)));
-    let head = repo.head()?;
-    let refname = head.name()?;
-    remote.push(&[format!("{refname}:{refname}")], Some(&mut push_options))
+    push_options.remote_callbacks(callbacks);
+
+    let head = repo.head().map_err(PushFailure::Transport)?;
+    let refname = head.name().map_err(PushFailure::Transport)?.to_string();
+    let push_result = remote.push(&[format!("{refname}:{refname}")], Some(&mut push_options));
+    // `push_options` (and the callbacks closure it owns) borrows `rejection`
+    // for as long as it's alive; drop it explicitly so that borrow ends
+    // before reading `rejection` back out below.
+    drop(push_options);
+    push_result.map_err(PushFailure::Transport)?;
+
+    match rejection.into_inner() {
+        Some(message) => Err(PushFailure::Rejected { refname, message }),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -392,7 +540,7 @@ mod tests {
             std::fs::write(local_path.join("hello.txt"), "hello\n")
         });
 
-        assert!(matches!(result, Err(crate::git_sync::SyncError::Pull(_))));
+        assert!(matches!(result, Err(crate::git_sync::SyncError::Pull { .. })));
         assert!(!write_ran.get(), "write should not run when the pull fails");
         assert!(!local_path.join("hello.txt").is_file());
         assert_eq!(commit_messages(&local_path), vec!["seed".to_string()]);
@@ -438,7 +586,7 @@ mod tests {
         });
 
         assert!(
-            matches!(result, Err(crate::git_sync::SyncError::Pull(_))),
+            matches!(result, Err(crate::git_sync::SyncError::Pull { .. })),
             "a genuine divergence should surface as a pull error, got {result:?}"
         );
         assert!(!write_ran.get(), "write should not run when the pull fails");
@@ -484,5 +632,119 @@ mod tests {
             None,
             "nothing should have been pushed"
         );
+    }
+
+    #[test]
+    fn sync_write_refuses_to_write_when_the_working_tree_is_already_dirty() {
+        let (_remote_dir, remote_path) = seeded_bare_remote();
+        let (_local_dir, local_path) = clone_local(&remote_path);
+        // Simulate a stray uncommitted change left by something outside
+        // this process, before `sync_write` ever runs.
+        std::fs::write(local_path.join("stray.txt"), "left behind\n")
+            .expect("failed to write stray file");
+
+        let write_ran = std::cell::Cell::new(false);
+        let result = crate::git_sync::sync_write(&local_path, "should never land", || {
+            write_ran.set(true);
+            std::fs::write(local_path.join("hello.txt"), "hello\n")
+        });
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::git_sync::SyncError::DirtyWorkingTree { .. })
+            ),
+            "expected SyncError::DirtyWorkingTree, got {result:?}"
+        );
+        assert!(
+            !write_ran.get(),
+            "write should not run when the working tree is already dirty"
+        );
+        assert!(!local_path.join("hello.txt").is_file());
+    }
+
+    #[test]
+    fn push_reports_a_non_fast_forward_as_a_transport_failure_over_local_transport() {
+        let (_remote_dir, remote_path) = seeded_bare_remote();
+        let (_local_dir, local_path) = clone_local(&remote_path);
+
+        // A second machine pulls, writes, and pushes — all after "local"
+        // already pulled (so "local" won't see it on its own next pull),
+        // but immediately before "local" pushes its own commit. This
+        // reproduces a race that a pull-before-write can't fully close:
+        // the remote moves again in the window between this call's pull
+        // and its push.
+        let (_other_dir, other_path) = clone_local(&remote_path);
+        std::fs::write(other_path.join("other.txt"), "other machine\n")
+            .expect("failed to write other machine's file");
+        let other_repo = Repository::open(&other_path).expect("failed to open other repo");
+        commit_all(&other_repo, "other machine's change");
+        let mut other_remote = other_repo
+            .find_remote("origin")
+            .expect("other repo should have a remote");
+        let other_refname = other_repo
+            .head()
+            .expect("other repo should have a HEAD")
+            .name()
+            .expect("HEAD should be named")
+            .to_string();
+        other_remote
+            .push(&[format!("{other_refname}:{other_refname}")], None)
+            .expect("other machine's push should succeed");
+
+        // "local" now pushes without ever pulling the other machine's
+        // change — its commit's parent is still "seed", so the remote
+        // (now at "other machine's change") rejects the non-fast-forward
+        // update.
+        std::fs::write(local_path.join("hello.txt"), "hello\n")
+            .expect("failed to write local file");
+        let local_repo = Repository::open(&local_path).expect("failed to open local repo");
+        commit_all(&local_repo, "local machine's change");
+
+        let result = super::push(&local_repo);
+
+        // Over the local (in-process filesystem) transport used by these
+        // tests, git2 rejects a non-fast-forward client-side, before the
+        // report-status protocol that drives `push_update_reference` ever
+        // runs — so this surfaces as `PushFailure::Transport`, not
+        // `PushFailure::Rejected`. A real smart-protocol remote (HTTP/SSH)
+        // that rejects a push instead reports it through that protocol,
+        // which does invoke `push_update_reference` and does surface as
+        // `PushFailure::Rejected` — not exercisable from a unit test
+        // without a real smart-protocol server.
+        assert!(
+            matches!(result, Err(super::PushFailure::Transport(_))),
+            "expected PushFailure::Transport, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_redacts_userinfo_from_an_embedded_url() {
+        let text = "failed to authenticate to https://user:s3cr3t@example.com/data.git";
+
+        let scrubbed = super::scrub_credentials(text);
+
+        assert_eq!(
+            scrubbed,
+            "failed to authenticate to https://[redacted]@example.com/data.git"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_leaves_text_without_embedded_credentials_unchanged() {
+        let text = "failed to authenticate to https://example.com/data.git";
+
+        let scrubbed = super::scrub_credentials(text);
+
+        assert_eq!(scrubbed, text);
+    }
+
+    #[test]
+    fn scrub_credentials_leaves_text_with_no_url_at_all_unchanged() {
+        let text = "the working tree already has uncommitted changes (hello.txt)";
+
+        let scrubbed = super::scrub_credentials(text);
+
+        assert_eq!(scrubbed, text);
     }
 }
