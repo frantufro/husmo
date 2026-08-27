@@ -45,3 +45,16 @@ pub(crate) fn seeded_bare_remote() -> (TempDir, PathBuf) {
 
     (remote_dir, remote_path)
 }
+
+/// Creates a bare "remote" repo with no commits at all — the state a
+/// freshly created GitHub repository is in before anyone pushes an initial
+/// commit (a README, a seed file, or otherwise). Used to exercise `husmo
+/// init` and the first-ever `sync_write` against a data repo whose remote
+/// was never seeded, as opposed to [`seeded_bare_remote`]'s already-has-a-
+/// commit case.
+pub(crate) fn empty_bare_remote() -> (TempDir, PathBuf) {
+    let remote_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let remote_path = remote_dir.path().join("remote.git");
+    Repository::init_bare(&remote_path).expect("failed to init bare remote");
+    (remote_dir, remote_path)
+}

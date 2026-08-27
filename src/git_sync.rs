@@ -237,13 +237,21 @@ pub(crate) fn remote_callbacks(repo: Option<&Repository>) -> git2::RemoteCallbac
 /// it isn't already up to date. Returns an error if the local branch has
 /// commits the remote doesn't (a diverged history) — reconciling that is
 /// out of scope for now (see the module docs).
+///
+/// Treats a remote with nothing to give (a freshly created repository with
+/// no branches yet) the same as already being up to date: git2 still writes
+/// a `FETCH_HEAD` file in that case, but an empty one that doesn't parse as
+/// a reference, so [`Repository::find_reference`] fails rather than
+/// returning something to fast-forward to.
 fn pull(repo: &Repository) -> Result<(), git2::Error> {
     let mut remote = repo.find_remote(REMOTE_NAME)?;
     let mut fetch_options = git2::FetchOptions::new();
     fetch_options.remote_callbacks(remote_callbacks(Some(repo)));
     remote.fetch::<&str>(&[], Some(&mut fetch_options), None)?;
 
-    let fetch_head = repo.find_reference("FETCH_HEAD")?;
+    let Ok(fetch_head) = repo.find_reference("FETCH_HEAD") else {
+        return Ok(());
+    };
     let fetch_commit = repo.reference_to_annotated_commit(&fetch_head)?;
 
     let (analysis, _preference) = repo.merge_analysis(&[&fetch_commit])?;
@@ -271,25 +279,34 @@ fn pull(repo: &Repository) -> Result<(), git2::Error> {
 /// [`CommitOutcome::NoChanges`], if the staged tree is identical to HEAD's
 /// (e.g. `write` left the working tree exactly as it found it) — there is
 /// nothing meaningful to commit or push in that case.
+///
+/// Also handles a repository with no commits yet (a data repo whose remote
+/// was created with no initial commit, so `husmo init`'s clone left HEAD
+/// unborn): there is no parent tree to compare against, so this always
+/// produces a root commit in that case rather than returning
+/// [`CommitOutcome::NoChanges`].
 fn commit_all(repo: &Repository, message: &str) -> Result<CommitOutcome, git2::Error> {
     let mut index = repo.index()?;
     index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
     index.write()?;
     let tree_id = index.write_tree()?;
-    let parent = repo.head()?.peel_to_commit()?;
-    if tree_id == parent.tree_id() {
+    let parent = repo.head().ok().map(|head| head.peel_to_commit()).transpose()?;
+    if let Some(parent) = &parent
+        && tree_id == parent.tree_id()
+    {
         return Ok(CommitOutcome::NoChanges);
     }
     let tree = repo.find_tree(tree_id)?;
 
     let signature = git2::Signature::now("husmo", "husmo@localhost")?;
+    let parents: Vec<&git2::Commit> = parent.iter().collect();
     repo.commit(
         Some("HEAD"),
         &signature,
         &signature,
         message,
         &tree,
-        &[&parent],
+        &parents,
     )?;
     Ok(CommitOutcome::Committed)
 }
@@ -350,7 +367,7 @@ mod tests {
     use git2::Repository;
     use tempfile::TempDir;
 
-    use crate::test_support::seeded_bare_remote;
+    use crate::test_support::{empty_bare_remote, seeded_bare_remote};
 
     /// Clones `remote_path` into a fresh temp dir, returning the clone.
     fn clone_local(remote_path: &Path) -> (TempDir, std::path::PathBuf) {
@@ -661,6 +678,28 @@ mod tests {
             "write should not run when the working tree is already dirty"
         );
         assert!(!local_path.join("hello.txt").is_file());
+    }
+
+    #[test]
+    fn sync_write_bootstraps_the_first_commit_against_a_freshly_cloned_empty_remote() {
+        // The state `husmo init` leaves behind when the remote was created
+        // with no initial commit: a local clone with no HEAD at all, and a
+        // remote with no branches to pull from.
+        let (_remote_dir, remote_path) = empty_bare_remote();
+        let (_local_dir, local_path) = clone_local(&remote_path);
+
+        crate::git_sync::sync_write(&local_path, "first document", || {
+            std::fs::write(local_path.join("hello.txt"), "hello\n")
+        })
+        .expect("sync_write should succeed against a fresh, unseeded remote");
+
+        assert!(local_path.join("hello.txt").is_file());
+        assert_eq!(commit_messages(&local_path), vec!["first document".to_string()]);
+        assert_eq!(
+            read_file_from_remote_tip(&remote_path, "hello.txt"),
+            Some("hello\n".to_string()),
+            "the root commit should have been pushed to the remote"
+        );
     }
 
     #[test]
