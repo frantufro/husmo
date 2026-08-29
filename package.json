@@ -11,8 +11,7 @@
   ],
   "publishConfig": { "access": "public" },
   "scripts": {
-    "test": "node --test tests/node/*.test.mjs",
-    "release": "node scripts/release.mjs"
+    "test": "node --test tests/node/*.test.mjs"
   },
   "engines": {
     "node": ">=18"

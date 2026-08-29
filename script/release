@@ -1,0 +1,193 @@
+#!/bin/sh
+# Bump husmo's version everywhere a release needs it, then commit the result on
+# a release branch. Pushing the tag stays a manual step, because that is what
+# starts the release workflow and publishes to GitHub Releases, Homebrew and
+# npm.
+#
+#   script/release 0.1.6      set an exact version
+#   script/release patch      bump one component (also: minor, major)
+#   script/release --check    report whether the version files already agree
+#
+# Options: --skip-tests skips `cargo test` and `npm test`.
+#
+# This lives in script/ because package.json packs all of bin/ into the npm
+# tarball, and this script is for maintainers of husmo itself.
+
+set -eu
+
+# Byte-wise matching, so the README's multibyte characters do not trip sed on
+# macOS.
+export LC_ALL=C
+
+cd "$(dirname "$0")/.."
+
+CARGO_TOML=Cargo.toml
+CARGO_LOCK=Cargo.lock
+PKG_JSON=package.json
+PLUGIN_JSON=claude-plugin/.claude-plugin/plugin.json
+README=README.md
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+# ------------------------------------------------------------------- reading
+
+cargo_version() {
+  awk '/^\[package\]/ { inpkg = 1; next }
+       /^\[/          { inpkg = 0 }
+       inpkg && /^version = "/ { gsub(/^version = "|"$/, ""); print; exit }' "$CARGO_TOML"
+}
+
+lock_version() {
+  awk '/^name = "husmo"$/ { getline; gsub(/^version = "|"$/, ""); print; exit }' "$CARGO_LOCK"
+}
+
+json_version() {
+  sed -n 's/^  "version": "\([^"]*\)".*/\1/p' "$1" | head -1
+}
+
+# The sample installer output under "Quick start" names the version it fetched.
+readme_version() {
+  sed -n 's/.*downloaded husmo \([0-9][0-9.]*\) to.*/\1/p' "$README" | head -1
+}
+
+# Prints every file whose version differs from $1. Returns 1 when any does.
+check_versions() {
+  expected=$1
+  mismatched=0
+  for pair in \
+    "$CARGO_TOML=$(cargo_version)" \
+    "$CARGO_LOCK=$(lock_version)" \
+    "$PKG_JSON=$(json_version "$PKG_JSON")" \
+    "$PLUGIN_JSON=$(json_version "$PLUGIN_JSON")" \
+    "$README=$(readme_version)"
+  do
+    file=${pair%%=*}
+    found=${pair#*=}
+    [ "$found" = "$expected" ] || {
+      printf '  %-40s %s\n' "$file" "${found:-(no version found)}" >&2
+      mismatched=1
+    }
+  done
+  [ "$mismatched" -eq 0 ]
+}
+
+# ------------------------------------------------------------------- writing
+
+edit() { # file, sed expression
+  sed "$2" "$1" > "$1.release.tmp" && mv "$1.release.tmp" "$1"
+}
+
+set_versions() {
+  version=$1
+  edit "$CARGO_TOML" "1,/^\[dependencies\]/s/^version = \".*\"$/version = \"$version\"/"
+  edit "$PKG_JSON" "s/^\(  \"version\": \"\)[^\"]*\(\".*\)$/\1$version\2/"
+  edit "$PLUGIN_JSON" "s/^\(  \"version\": \"\)[^\"]*\(\".*\)$/\1$version\2/"
+  edit "$README" "s/downloaded husmo [0-9][0-9.]* to/downloaded husmo $version to/"
+  # Refreshes the husmo entry in Cargo.lock without building anything.
+  cargo metadata --format-version 1 > /dev/null
+}
+
+next_version() { # current, part
+  IFS=. read -r major minor patch <<EOF
+$1
+EOF
+  case $2 in
+    major) printf '%s.0.0\n' "$((major + 1))" ;;
+    minor) printf '%s.%s.0\n' "$major" "$((minor + 1))" ;;
+    patch) printf '%s.%s.%s\n' "$major" "$minor" "$((patch + 1))" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------- main
+
+run_tests=yes
+target=
+
+for arg in "$@"; do
+  case $arg in
+    --check)
+      current=$(cargo_version)
+      [ -n "$current" ] || die "could not read a version from $CARGO_TOML"
+      if check_versions "$current"; then
+        printf 'version %s agrees across every version file\n' "$current"
+        exit 0
+      fi
+      die "the files above disagree with $CARGO_TOML ($current)"
+      ;;
+    --skip-tests) run_tests=no ;;
+    -h|--help)
+      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    -*) die "unknown option: $arg" ;;
+    *) target=$arg ;;
+  esac
+done
+
+[ -n "$target" ] || die "usage: script/release <version|patch|minor|major> [--skip-tests]"
+
+current=$(cargo_version)
+[ -n "$current" ] || die "could not read a version from $CARGO_TOML"
+
+case $target in
+  patch|minor|major) version=$(next_version "$current" "$target") ;;
+  *)
+    printf '%s' "$target" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      || die "not a version: $target (expected N.N.N, patch, minor or major)"
+    version=$target
+    ;;
+esac
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+[ "$branch" = main ] || die "releases start from main; you are on $branch"
+[ -z "$(git status --porcelain)" ] || die "the working tree has uncommitted changes"
+
+git fetch -q origin main
+[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] \
+  || die "main and origin/main have diverged; pull or push first"
+
+git rev-parse -q --verify "refs/tags/v$version" > /dev/null \
+  && die "tag v$version already exists locally"
+[ -z "$(git ls-remote --tags origin "v$version")" ] \
+  || die "tag v$version already exists on origin"
+
+printf 'releasing %s -> %s\n' "$current" "$version"
+
+set_versions "$version"
+
+if ! check_versions "$version"; then
+  die "the files above did not take the new version; nothing was committed"
+fi
+printf '  version %s written to every version file\n' "$version"
+
+if [ "$run_tests" = yes ]; then
+  printf '  running cargo test\n'
+  cargo test --quiet
+  printf '  running npm test\n'
+  npm test --silent
+fi
+
+git checkout -q -b "release/v$version"
+git add "$CARGO_TOML" "$CARGO_LOCK" "$PKG_JSON" "$PLUGIN_JSON" "$README"
+git commit -q -F - <<EOF
+chore: release $version
+
+Set $version in Cargo.toml, package.json, the Claude Code plugin manifest
+and the README sample, and refresh Cargo.lock.
+EOF
+
+cat <<EOF
+
+committed on release/v$version. To finish:
+
+  gh pr create --fill
+  gh pr merge --squash --delete-branch
+  git checkout main && git pull
+  git tag v$version && git push origin v$version
+
+The last line starts the release workflow, which publishes the GitHub
+release, the Homebrew formula and @frantufro/husmo@$version.
+EOF
