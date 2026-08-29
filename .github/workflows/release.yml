@@ -165,3 +165,48 @@ jobs:
           fi
           git commit -m "husmo ${TAG#v}"
           git push
+
+  publish-npm:
+    name: Publish installer to npm
+    needs: release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      # Required for npm trusted publishing: npm exchanges this token for
+      # publish rights, so the repository stores no npm credential.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs npm 11.5.1 or newer.
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Assert every version site matches the tag
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          cargo_version=$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          npm_version=$(node -p "require('./package.json').version")
+          plugin_version=$(node -p "require('./claude-plugin/.claude-plugin/plugin.json').version")
+          echo "tag=$VERSION cargo=$cargo_version npm=$npm_version plugin=$plugin_version"
+          for pair in "Cargo.toml:$cargo_version" "package.json:$npm_version" "plugin.json:$plugin_version"; do
+            if [ "${pair#*:}" != "$VERSION" ]; then
+              echo "::error::${pair%%:*} reads ${pair#*:}, tag is $VERSION" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test the installer
+        run: npm test
+
+      - name: Publish
+        run: npm publish

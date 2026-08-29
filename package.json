@@ -1,0 +1,42 @@
+{
+  "name": "@frantufro/husmo",
+  "version": "0.1.0",
+  "description": "Install the husmo skill and MCP registration into OpenCode, and the husmo binary if it is missing",
+  "bin": {
+    "husmo-install": "bin/install.mjs"
+  },
+  "files": [
+    "bin",
+    "claude-plugin/skills"
+  ],
+  "publishConfig": { "access": "public" },
+  "scripts": {
+    "test": "node --test tests/node/*.test.mjs",
+    "release": "node scripts/release.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-skill",
+    "agent-skill",
+    "mcp",
+    "husmo",
+    "documents",
+    "search"
+  ],
+  "author": "Fran Tufro",
+  "license": "MIT",
+  "homepage": "https://github.com/frantufro/husmo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/frantufro/husmo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/frantufro/husmo/issues"
+  }
+}
