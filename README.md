@@ -122,7 +122,7 @@ That installs the three pieces OpenCode needs and reports on a fourth:
 
 ```
   ✓ skill   installed  ~/.config/opencode/skills/husmo-document-management
-  ✓ binary  downloaded husmo 0.1.0 to ~/.local/bin/husmo
+  ✓ binary  downloaded husmo 0.1.1 to ~/.local/bin/husmo
   ✓ mcp     registered husmo in  ~/.config/opencode/opencode.json
   → data    no config at ~/.config/husmo/config.toml
     create a data repo before using husmo's tools:

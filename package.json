@@ -1,6 +1,6 @@
 {
   "name": "@frantufro/husmo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Install the husmo skill and MCP registration into OpenCode, and the husmo binary if it is missing",
   "bin": {
     "husmo-install": "bin/install.mjs"
