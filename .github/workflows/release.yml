@@ -9,8 +9,54 @@ permissions:
   contents: write
 
 jobs:
+  # Nothing is built or published until the tag and the files that carry a
+  # version agree. This check used to live in publish-npm, the last job, so a
+  # version left behind was caught only after the GitHub release and the
+  # Homebrew formula were already out and needed unpicking by hand.
+  verify:
+    name: Verify the release
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Verify the tag and every version file agree
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          mismatched=0
+          check() {
+            [ "$2" = "$VERSION" ] || {
+              echo "$1 is $2 but the tag is $VERSION" >&2
+              mismatched=1
+            }
+          }
+          check Cargo.toml \
+            "$(awk '/^\[package\]/ { inpkg = 1; next } /^\[/ { inpkg = 0 } inpkg && /^version = "/ { gsub(/^version = "|"$/, ""); print; exit }' Cargo.toml)"
+          check Cargo.lock \
+            "$(awk '/^name = "husmo"$/ { getline; gsub(/^version = "|"$/, ""); print; exit }' Cargo.lock)"
+          check package.json "$(node -p "require('./package.json').version")"
+          check claude-plugin/.claude-plugin/plugin.json \
+            "$(node -p "require('./claude-plugin/.claude-plugin/plugin.json').version")"
+          check README.md \
+            "$(sed -n 's/.*downloaded husmo \([0-9][0-9.]*\) to.*/\1/p' README.md | head -1)"
+          [ "$mismatched" -eq 0 ] || exit 1
+          echo "version $VERSION agrees across the tag and every version file"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test the installer
+        run: npm test
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -25,7 +71,7 @@ jobs:
             use_cross: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -52,7 +98,7 @@ jobs:
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: husmo-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
@@ -63,13 +109,13 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/husmo-*.tar.gz
 
@@ -81,7 +127,7 @@ jobs:
       TAG: ${{ github.ref_name }}
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -102,7 +148,7 @@ jobs:
           done
 
       - name: Checkout homebrew-tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: frantufro/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -176,37 +222,15 @@ jobs:
       # publish rights, so the repository stores no npm credential.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      # Node 24 bundles an npm new enough for trusted publishing.
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      # Trusted publishing needs npm 11.5.1 or newer.
-      - name: Update npm
-        run: npm install -g npm@latest
-
-      - name: Assert every version site matches the tag
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          cargo_version=$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
-          npm_version=$(node -p "require('./package.json').version")
-          plugin_version=$(node -p "require('./claude-plugin/.claude-plugin/plugin.json').version")
-          echo "tag=$VERSION cargo=$cargo_version npm=$npm_version plugin=$plugin_version"
-          for pair in "Cargo.toml:$cargo_version" "package.json:$npm_version" "plugin.json:$plugin_version"; do
-            if [ "${pair#*:}" != "$VERSION" ]; then
-              echo "::error::${pair%%:*} reads ${pair#*:}, tag is $VERSION" >&2
-              exit 1
-            fi
-          done
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Test the installer
-        run: npm test
-
+      # Authentication comes from the OIDC token minted for this run, which
+      # npm trades for a short-lived publish token. Provenance is automatic.
       - name: Publish
-        run: npm publish
+        run: npm publish --access public
