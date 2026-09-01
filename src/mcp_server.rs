@@ -239,6 +239,19 @@ pub struct SaveResult {
     pub outgoing_links: Vec<OutgoingLinkDto>,
 }
 
+/// A schema for an unsigned count, carrying no `format` annotation.
+///
+/// schemars renders `usize` as `{"type": "integer", "format": "uint",
+/// "minimum": 0}`. JSON Schema registers no `uint` format, so `OpenCode`'s
+/// validator logs `unknown format "uint" ignored in schema` on every connect.
+/// The annotation constrains nothing that `minimum` does not already cover.
+fn unsigned_count_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "minimum": 0
+    })
+}
+
 /// The default number of hits `search-semantic` returns when the caller
 /// doesn't specify `top_k`.
 fn default_top_k() -> usize {
@@ -255,6 +268,7 @@ pub struct SearchSemanticParams {
     /// Maximum number of Documents to return, most similar first. Defaults
     /// to 10.
     #[serde(default = "default_top_k")]
+    #[schemars(schema_with = "unsigned_count_schema")]
     pub top_k: usize,
     /// When `true`, each hit's `expanded_related` is populated with the
     /// full content of every Document it's Related to. Defaults to
@@ -319,6 +333,7 @@ pub struct FulltextSearchHitDto {
     pub document: DocumentDto,
     /// How many times the query occurs (case-insensitively) across the
     /// Document's title and content combined.
+    #[schemars(schema_with = "unsigned_count_schema")]
     pub match_count: usize,
 }
 
@@ -2021,6 +2036,52 @@ mod tests {
             info.capabilities.resources.is_some(),
             "expected the server to advertise the resources capability, got {:?}",
             info.capabilities
+        );
+    }
+    /// Walks `value` and collects the value of every `format` keyword it
+    /// carries, paired with the path it sits at.
+    fn formats_in(value: &serde_json::Value, path: &str, found: &mut Vec<(String, String)>) {
+        let serde_json::Value::Object(map) = value else {
+            if let serde_json::Value::Array(items) = value {
+                for (index, item) in items.iter().enumerate() {
+                    formats_in(item, &format!("{path}/{index}"), found);
+                }
+            }
+            return;
+        };
+        if let Some(serde_json::Value::String(format)) = map.get("format") {
+            found.push((path.to_string(), format.clone()));
+        }
+        for (key, child) in map {
+            formats_in(child, &format!("{path}/{key}"), found);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_schemas_carry_no_schemars_specific_unsigned_format() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let (client, server_handle) = connect(dir.path().to_path_buf()).await;
+        let tools = client.list_all_tools().await.expect("listing tools should succeed");
+        client.cancel().await.expect("client should shut down cleanly");
+        server_handle.await.expect("server task should not panic");
+
+        let mut offenders = Vec::new();
+        for tool in &tools {
+            let input = serde_json::Value::Object((*tool.input_schema).clone());
+            formats_in(&input, &format!("{}:input", tool.name), &mut offenders);
+            if let Some(output) = &tool.output_schema {
+                let output = serde_json::Value::Object((**output).clone());
+                formats_in(&output, &format!("{}:output", tool.name), &mut offenders);
+            }
+        }
+        offenders.retain(|(_, format)| format.starts_with("uint"));
+
+        assert!(
+            offenders.is_empty(),
+            "schemars renders Rust's unsigned integers with a `format` no JSON Schema \
+             vocabulary registers, and OpenCode logs `unknown format` for each one on \
+             connect; found {offenders:?}"
         );
     }
 }
