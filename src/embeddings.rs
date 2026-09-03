@@ -54,7 +54,12 @@ impl DocumentEmbeddings {
     pub fn build(document: &Document) -> Result<Self, EmbeddingsError> {
         let chunks = chunk(&document.content)
             .into_iter()
-            .map(|text| Ok(ChunkEmbedding { vector: embed(&text)?, chunk: text }))
+            .map(|text| {
+                Ok(ChunkEmbedding {
+                    vector: embed(&text)?,
+                    chunk: text,
+                })
+            })
             .collect::<Result<Vec<_>, EmbedError>>()?;
         Ok(DocumentEmbeddings {
             document_id: document.id.clone(),
@@ -288,8 +293,7 @@ mod tests {
         let document = Document::new("My Title", "Some content.\n\nMore content.");
         let embeddings = DocumentEmbeddings::build(&document).expect("build should succeed");
 
-        let path =
-            write(dir.path(), &document.slug, &embeddings).expect("write should succeed");
+        let path = write(dir.path(), &document.slug, &embeddings).expect("write should succeed");
         let loaded = read(&path).expect("read should succeed");
 
         assert_eq!(loaded, embeddings);
@@ -313,7 +317,8 @@ mod tests {
     fn remove_is_a_no_op_when_no_sidecar_file_exists() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
 
-        remove(dir.path(), "does-not-exist").expect("remove should succeed even with no sidecar file");
+        remove(dir.path(), "does-not-exist")
+            .expect("remove should succeed even with no sidecar file");
     }
 
     #[test]

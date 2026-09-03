@@ -98,7 +98,11 @@ fn resolve_related(document: &Document, documents: &[Document]) -> Vec<Document>
     document
         .related
         .iter()
-        .filter_map(|related_id| documents.iter().find(|candidate| &candidate.id == related_id))
+        .filter_map(|related_id| {
+            documents
+                .iter()
+                .find(|candidate| &candidate.id == related_id)
+        })
         .cloned()
         .collect()
 }
@@ -114,8 +118,10 @@ mod tests {
             "Rust",
             "Intro paragraph.\n\nRust is a systems programming language with strong static typing.",
         );
-        let baking_doc =
-            Document::new("Bread", "Bake the sourdough loaf for forty minutes at high heat.");
+        let baking_doc = Document::new(
+            "Bread",
+            "Bake the sourdough loaf for forty minutes at high heat.",
+        );
         let documents = vec![rust_doc.clone(), baking_doc.clone()];
         let index = VectorIndex::build(&[
             DocumentEmbeddings::build(&rust_doc).expect("build should succeed"),
@@ -209,8 +215,9 @@ mod tests {
         let mut main_doc = Document::new("Main", "Rust systems programming content.");
         main_doc.related = vec!["missing-id".to_string()];
         let documents = vec![main_doc.clone()];
-        let index =
-            VectorIndex::build(&[DocumentEmbeddings::build(&main_doc).expect("build should succeed")]);
+        let index = VectorIndex::build(&[
+            DocumentEmbeddings::build(&main_doc).expect("build should succeed")
+        ]);
 
         let hits = semantic_search(&index, &documents, "rust systems programming", 1, true)
             .expect("semantic_search should succeed");

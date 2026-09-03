@@ -89,7 +89,10 @@ pub struct ArchivedLink {
 /// [`ArchiveError::Image`] if one of the page's images can't be downloaded,
 /// or [`ArchiveError::Store`]/[`ArchiveError::Embeddings`] if writing the
 /// Document or its embeddings sidecar fails.
-pub fn archive_outgoing_link(dir: &Path, link: &OutgoingLink) -> Result<ArchivedLink, ArchiveError> {
+pub fn archive_outgoing_link(
+    dir: &Path,
+    link: &OutgoingLink,
+) -> Result<ArchivedLink, ArchiveError> {
     let (document, outgoing_links) = fetch_and_build_document(dir, &link.url, &link.text)?;
 
     store::write(dir, &document)?;
@@ -169,8 +172,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().expect("failed to create temp dir");
 
-        let archived =
-            archive_outgoing_link(dir.path(), &link).expect("archiving should succeed");
+        let archived = archive_outgoing_link(dir.path(), &link).expect("archiving should succeed");
 
         assert_eq!(archived.document.canonical_url, Some(url.clone()));
         assert_eq!(archived.document.title, "Discovered Page");
@@ -194,8 +196,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().expect("failed to create temp dir");
 
-        let archived =
-            archive_outgoing_link(dir.path(), &link).expect("archiving should succeed");
+        let archived = archive_outgoing_link(dir.path(), &link).expect("archiving should succeed");
 
         assert_eq!(
             archived.outgoing_links,
@@ -206,10 +207,8 @@ mod tests {
             "the newly archived document's own outgoing link should be reported as data"
         );
 
-        let further_lookup = store::resolve(
-            dir.path(),
-            &store::Identifier::Url(further_url.to_string()),
-        );
+        let further_lookup =
+            store::resolve(dir.path(), &store::Identifier::Url(further_url.to_string()));
         assert!(
             matches!(further_lookup, Err(store::ResolveError::NotFound(_))),
             "archiving should not itself follow the discovered link and create a Document for it"

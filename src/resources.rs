@@ -79,7 +79,11 @@ pub const DEFAULT_PAGE_SIZE: usize = 50;
 /// calls) degrades gracefully: pagination simply resumes after where that
 /// slug would have sorted, rather than erroring.
 #[must_use]
-pub fn paginate(mut documents: Vec<Document>, cursor: Option<&str>, page_size: usize) -> ResourcePage {
+pub fn paginate(
+    mut documents: Vec<Document>,
+    cursor: Option<&str>,
+    page_size: usize,
+) -> ResourcePage {
     documents.sort_by(|a, b| a.slug.cmp(&b.slug));
     let start = match cursor {
         Some(cursor) => documents.partition_point(|doc| doc.slug.as_str() <= cursor),
@@ -159,19 +163,23 @@ mod tests {
 
     #[test]
     fn paginate_splits_into_pages_by_sorted_slug_and_resumes_from_the_cursor() {
-        let documents = vec![
-            doc_with_slug("c"),
-            doc_with_slug("a"),
-            doc_with_slug("b"),
-        ];
+        let documents = vec![doc_with_slug("c"), doc_with_slug("a"), doc_with_slug("b")];
 
         let first = paginate(documents.clone(), None, 2);
-        let first_slugs: Vec<&str> = first.documents.iter().map(|doc| doc.slug.as_str()).collect();
+        let first_slugs: Vec<&str> = first
+            .documents
+            .iter()
+            .map(|doc| doc.slug.as_str())
+            .collect();
         assert_eq!(first_slugs, vec!["a", "b"]);
         assert_eq!(first.next_cursor, Some("b".to_string()));
 
         let second = paginate(documents, first.next_cursor.as_deref(), 2);
-        let second_slugs: Vec<&str> = second.documents.iter().map(|doc| doc.slug.as_str()).collect();
+        let second_slugs: Vec<&str> = second
+            .documents
+            .iter()
+            .map(|doc| doc.slug.as_str())
+            .collect();
         assert_eq!(second_slugs, vec!["c"]);
         assert_eq!(second.next_cursor, None);
     }

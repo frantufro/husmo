@@ -103,9 +103,7 @@ pub fn localize_images(
 /// inline rather than pointing at a server to fetch them from, so
 /// `fetch::fetch_bytes` has nothing to ask for and would only fail on it.
 fn is_fetchable(url: &str) -> bool {
-    url::Url::parse(url)
-        .map(|url| url.scheme() == "http" || url.scheme() == "https")
-        .unwrap_or(false)
+    url::Url::parse(url).is_ok_and(|url| url.scheme() == "http" || url.scheme() == "https")
 }
 
 /// Derives a local filename for `url` from its last path segment, deduped
@@ -223,8 +221,7 @@ mod tests {
             first_bytes
         );
         assert_eq!(
-            std::fs::read(dest_dir.path().join("photo-2.jpg"))
-                .expect("second image should exist"),
+            std::fs::read(dest_dir.path().join("photo-2.jpg")).expect("second image should exist"),
             second_bytes
         );
     }
@@ -241,7 +238,10 @@ mod tests {
         let rewritten = localize_images(markdown, &images, dest_dir.path())
             .expect("localize_images should succeed");
 
-        assert_eq!(rewritten, markdown, "a data: URI has nothing to fetch, so it's left as-is");
+        assert_eq!(
+            rewritten, markdown,
+            "a data: URI has nothing to fetch, so it's left as-is"
+        );
         assert_eq!(
             std::fs::read_dir(dest_dir.path())
                 .expect("dest dir should be readable")
@@ -272,8 +272,7 @@ mod tests {
             .expect("localize_images should succeed");
 
         assert_eq!(
-            rewritten,
-            "![First](shared.png)\n\n![Second](shared.png)",
+            rewritten, "![First](shared.png)\n\n![Second](shared.png)",
             "both references to the same URL should point at the same local file"
         );
         let entries: Vec<_> = std::fs::read_dir(dest_dir.path())
