@@ -49,6 +49,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The embedding tests run all-MiniLM-L6-v2 for real, and hf-hub fetches
+      # its ~96MB of weights on a cold cache. The key carries Cargo.lock's
+      # hash and has no restore-keys, so bumping hf-hub forces the download
+      # path to run again instead of coasting on a warm cache.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-all-MiniLM-L6-v2-${{ hashFiles('Cargo.lock') }}
+
       # --locked fails when Cargo.lock is out of date, which catches a version
       # bump that moved Cargo.toml without refreshing the lock.
       - run: cargo test --locked

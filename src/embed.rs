@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
-use hf_hub::api::sync::{Api, ApiError};
+use hf_hub::api::sync::{ApiBuilder, ApiError};
 use tokenizers::{Tokenizer, TruncationParams};
 
 /// Hugging Face Hub id of the pre-trained sentence-embedding model this
@@ -106,10 +106,13 @@ pub enum LoadModelError {
 /// and weights, and builds the [`Model`] they describe.
 ///
 /// The Hugging Face Hub API this calls into caches every file it fetches
-/// under the OS's standard cache directory (respecting `HF_HOME`), so only
-/// the very first call across every process on a machine performs any
-/// network I/O; every later one, including in future runs, reads that
-/// local cache instead.
+/// under the OS's standard cache directory, so only the very first call
+/// across every process on a machine performs any network I/O; every later
+/// one, including in future runs, reads that local cache instead.
+///
+/// The client is built through `ApiBuilder::from_env`, which is what reads
+/// `HF_HOME` for the cache location and `HF_ENDPOINT` for a mirror of the
+/// Hub. `ApiBuilder::new` consults neither.
 ///
 /// # Errors
 ///
@@ -117,7 +120,8 @@ pub enum LoadModelError {
 /// their contents don't parse as the expected BERT config, tokenizer, or
 /// safetensors weights.
 fn load_model() -> Result<Model, LoadModelError> {
-    let repo = Api::new()
+    let repo = ApiBuilder::from_env()
+        .build()
         .map_err(LoadModelError::HubClient)?
         .model(MODEL_ID.to_string());
 

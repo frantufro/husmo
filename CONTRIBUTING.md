@@ -13,6 +13,11 @@ cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
 
+The first `cargo test` on a machine downloads all-MiniLM-L6-v2 — about 96MB
+— because the embedding tests run the real model. It lands in
+`~/.cache/huggingface` (or under `HF_HOME`), shared with every other tool
+that uses the Hugging Face cache, and every later run reads it from there.
+
 `[lints.clippy]` in `Cargo.toml` already turns the pedantic set on for every
 build and denies bare `#[allow]` in favour of `#[expect]`, so the clippy line
 above only has to promote warnings to errors.
