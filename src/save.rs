@@ -200,7 +200,11 @@ fn save_url(dir: &Path, url: &str) -> Result<(Document, Vec<OutgoingLink>), Save
 /// There is no `canonical_url` and no extraction step for a local file, so
 /// re-saving the same path always creates a new Document rather than
 /// overwriting one in place.
-fn save_local_file(dir: &Path, path: &Path, path_policy: &PathPolicy) -> Result<Document, SaveError> {
+fn save_local_file(
+    dir: &Path,
+    path: &Path,
+    path_policy: &PathPolicy,
+) -> Result<Document, SaveError> {
     let canonical_path =
         local_file::validate_source_path(path, path_policy).map_err(LocalFileIngestError::from)?;
     let content = local_file::ingest(&canonical_path)?;
@@ -264,7 +268,10 @@ mod tests {
 
     #[test]
     fn save_input_rejects_zero_inputs() {
-        assert_eq!(save_input(None, None, None, None), Err(SaveInputError::None));
+        assert_eq!(
+            save_input(None, None, None, None),
+            Err(SaveInputError::None)
+        );
     }
 
     #[test]
@@ -331,7 +338,10 @@ mod tests {
         )
         .expect("save should succeed");
 
-        assert_eq!(output.document.tags, vec!["rust".to_string(), "notes".to_string()]);
+        assert_eq!(
+            output.document.tags,
+            vec!["rust".to_string(), "notes".to_string()]
+        );
     }
 
     #[test]
@@ -381,7 +391,12 @@ mod tests {
             home: None,
         };
 
-        let result = save(dir.path(), SaveInput::LocalFile(file_path), Vec::new(), &policy);
+        let result = save(
+            dir.path(),
+            SaveInput::LocalFile(file_path),
+            Vec::new(),
+            &policy,
+        );
 
         assert!(
             matches!(
@@ -462,7 +477,9 @@ mod tests {
         );
 
         let output = save(
-            tempfile::tempdir().expect("failed to create temp dir").path(),
+            tempfile::tempdir()
+                .expect("failed to create temp dir")
+                .path(),
             SaveInput::Url(url.clone()),
             Vec::new(),
             &PathPolicy::default(),
@@ -490,10 +507,20 @@ mod tests {
         );
         let dir = tempfile::tempdir().expect("failed to create temp dir");
 
-        let first = save(dir.path(), SaveInput::Url(url.clone()), Vec::new(), &PathPolicy::default())
-            .expect("first save should succeed");
-        let second = save(dir.path(), SaveInput::Url(url.clone()), Vec::new(), &PathPolicy::default())
-            .expect("second save should succeed");
+        let first = save(
+            dir.path(),
+            SaveInput::Url(url.clone()),
+            Vec::new(),
+            &PathPolicy::default(),
+        )
+        .expect("first save should succeed");
+        let second = save(
+            dir.path(),
+            SaveInput::Url(url.clone()),
+            Vec::new(),
+            &PathPolicy::default(),
+        )
+        .expect("second save should succeed");
 
         assert_eq!(second.document.id, first.document.id);
         assert_eq!(second.document.slug, first.document.slug);
@@ -517,15 +544,25 @@ mod tests {
         );
         let dir = tempfile::tempdir().expect("failed to create temp dir");
 
-        let first = save(dir.path(), SaveInput::Url(url.clone()), Vec::new(), &PathPolicy::default())
-            .expect("first save should succeed");
+        let first = save(
+            dir.path(),
+            SaveInput::Url(url.clone()),
+            Vec::new(),
+            &PathPolicy::default(),
+        )
+        .expect("first save should succeed");
         let other = Document::new("Other Document", "other content");
         crate::store::write(dir.path(), &other).expect("write should succeed");
         crate::related::relate(dir.path(), &first.document.id, &other.id)
             .expect("relate should succeed");
 
-        let second = save(dir.path(), SaveInput::Url(url), Vec::new(), &PathPolicy::default())
-            .expect("second save should succeed");
+        let second = save(
+            dir.path(),
+            SaveInput::Url(url),
+            Vec::new(),
+            &PathPolicy::default(),
+        )
+        .expect("second save should succeed");
 
         assert_eq!(
             second.document.related,
@@ -533,11 +570,9 @@ mod tests {
             "re-saving the same url should not wipe the Document's related edges"
         );
 
-        let reloaded_other = crate::store::resolve(
-            dir.path(),
-            &crate::store::Identifier::Id(other.id.clone()),
-        )
-        .expect("resolve should succeed");
+        let reloaded_other =
+            crate::store::resolve(dir.path(), &crate::store::Identifier::Id(other.id.clone()))
+                .expect("resolve should succeed");
         assert_eq!(
             reloaded_other.related,
             vec![second.document.id.clone()],

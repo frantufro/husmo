@@ -62,7 +62,10 @@ mod tests {
 
         assert_eq!(
             chunk(content),
-            vec!["First paragraph.".to_string(), "Second paragraph.".to_string()]
+            vec![
+                "First paragraph.".to_string(),
+                "Second paragraph.".to_string()
+            ]
         );
     }
 
@@ -72,7 +75,10 @@ mod tests {
 
         assert_eq!(
             chunk(content),
-            vec!["First paragraph.".to_string(), "Second paragraph.".to_string()]
+            vec![
+                "First paragraph.".to_string(),
+                "Second paragraph.".to_string()
+            ]
         );
     }
 
@@ -132,7 +138,9 @@ mod tests {
 
         assert_eq!(
             chunk(content),
-            vec!["Intro paragraph.\n#hashtag-not-a-heading\nMore of the same paragraph.".to_string()]
+            vec![
+                "Intro paragraph.\n#hashtag-not-a-heading\nMore of the same paragraph.".to_string()
+            ]
         );
     }
 }

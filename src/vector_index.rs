@@ -41,11 +41,14 @@ impl VectorIndex {
         let chunks = embeddings
             .iter()
             .flat_map(|document| {
-                document.chunks.iter().map(move |chunk_embedding| IndexedChunk {
-                    document_id: document.document_id.clone(),
-                    chunk: chunk_embedding.chunk.clone(),
-                    vector: chunk_embedding.vector.clone(),
-                })
+                document
+                    .chunks
+                    .iter()
+                    .map(move |chunk_embedding| IndexedChunk {
+                        document_id: document.document_id.clone(),
+                        chunk: chunk_embedding.chunk.clone(),
+                        vector: chunk_embedding.vector.clone(),
+                    })
             })
             .collect();
         VectorIndex { chunks }
@@ -145,7 +148,10 @@ mod tests {
                 "rust-doc",
                 &["Rust is a systems programming language with strong static typing."],
             ),
-            fixture("baking-doc", &["Bake the sourdough loaf for forty minutes at high heat."]),
+            fixture(
+                "baking-doc",
+                &["Bake the sourdough loaf for forty minutes at high heat."],
+            ),
         ];
         let index = VectorIndex::build(&embeddings);
 
@@ -179,7 +185,9 @@ mod tests {
         let embeddings = vec![fixture("doc", &["only chunk"])];
         let index = VectorIndex::build(&embeddings);
 
-        let hits = index.search("only chunk", 5).expect("search should succeed");
+        let hits = index
+            .search("only chunk", 5)
+            .expect("search should succeed");
 
         assert_eq!(hits.len(), 1);
     }

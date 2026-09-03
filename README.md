@@ -315,10 +315,12 @@ has no MCP tool of its own yet — deciding which discovered links are worth
 archiving is left to a Skill layered on top of this server, per
 `docs/ARCHITECTURE.md` ("Content extraction").
 
-## Development
+## Contributing
 
-```sh
-cargo test
-cargo clippy -- -D warnings -W clippy::pedantic
-cargo fmt
-```
+Build it with `cargo build`, run the suite with `cargo test`.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the lint setup, the project layout
+and how a release is cut.
+
+## License
+
+MIT

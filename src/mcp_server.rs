@@ -181,10 +181,13 @@ fn resolve_related_refs(documents: &[Document], related_ids: &[String]) -> Vec<R
     related_ids
         .iter()
         .filter_map(|id| {
-            documents.iter().find(|doc| doc.id == *id).map(|doc| RelatedRefDto {
-                id: doc.id.clone(),
-                title: doc.title.clone(),
-            })
+            documents
+                .iter()
+                .find(|doc| doc.id == *id)
+                .map(|doc| RelatedRefDto {
+                    id: doc.id.clone(),
+                    title: doc.title.clone(),
+                })
         })
         .collect()
 }
@@ -434,8 +437,8 @@ impl HusmoServer {
         .map_err(|error| ErrorData::internal_error(format!("save task panicked: {error}"), None))?
         .map_err(|error| sync_error_to_mcp_error(&error))?;
 
-        let documents =
-            store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents = store::load_all(&self.data_repo_path)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
         let related = resolve_related_refs(&documents, &output.document.related);
         Ok(Json(SaveResult {
             document: DocumentDto::from_document(output.document, related),
@@ -454,13 +457,16 @@ impl HusmoServer {
             the Document, including its Related list by reference (id and title; use \
             `search-*` with expansion to pull in their content)."
     )]
-    async fn get(&self, Parameters(params): Parameters<GetParams>) -> Result<Json<DocumentDto>, ErrorData> {
+    async fn get(
+        &self,
+        Parameters(params): Parameters<GetParams>,
+    ) -> Result<Json<DocumentDto>, ErrorData> {
         let identifier = store::identifier(params.id, params.slug, params.url)
             .map_err(identifier_error_to_mcp_error)?;
         let document = store::resolve(&self.data_repo_path, &identifier)
             .map_err(|error| resolve_error_to_mcp_error(&error))?;
-        let documents =
-            store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents = store::load_all(&self.data_repo_path)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
         let related = resolve_related_refs(&documents, &document.related);
         Ok(Json(DocumentDto::from_document(document, related)))
     }
@@ -486,7 +492,8 @@ impl HusmoServer {
         &self,
         Parameters(params): Parameters<SearchSemanticParams>,
     ) -> Result<Json<SearchSemanticResult>, ErrorData> {
-        let documents = store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents = store::load_all(&self.data_repo_path)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
         let index = vector_index::build_from_dir(&self.data_repo_path)
             .map_err(|error| embeddings_error_to_mcp_error(&error))?;
         let hits = semantic_search::semantic_search(
@@ -519,7 +526,8 @@ impl HusmoServer {
         &self,
         Parameters(params): Parameters<SearchTagParams>,
     ) -> Result<Json<SearchTagResult>, ErrorData> {
-        let documents = store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents = store::load_all(&self.data_repo_path)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
         let hits = tag_search::tag_search(&documents, &params.tag);
 
         let result_documents = hits
@@ -549,7 +557,8 @@ impl HusmoServer {
         &self,
         Parameters(params): Parameters<SearchFulltextParams>,
     ) -> Result<Json<SearchFulltextResult>, ErrorData> {
-        let documents = store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents = store::load_all(&self.data_repo_path)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
         let hits = fulltext_search::fulltext_search(&documents, &params.query);
 
         let hits = hits
@@ -562,10 +571,13 @@ impl HusmoServer {
     /// Lists every Document in the data repo, per `docs/ARCHITECTURE.md`
     /// ("MCP server"): "`list`" (browse all Documents). A pure local read,
     /// so it runs directly rather than on the blocking thread pool.
-    #[tool(description = "List every Document in the data repo, including each one's \
-        Related list by reference.")]
+    #[tool(
+        description = "List every Document in the data repo, including each one's \
+        Related list by reference."
+    )]
     async fn list(&self) -> Result<Json<ListResult>, ErrorData> {
-        let documents = store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents = store::load_all(&self.data_repo_path)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
         let dtos = documents
             .clone()
             .into_iter()
@@ -578,11 +590,13 @@ impl HusmoServer {
     /// (`crate::related::relate`), then runs the git pull/commit/push cycle
     /// around the write, per `docs/ARCHITECTURE.md` ("Git mechanics"): every
     /// mutating operation, including `relate`, goes through it.
-    #[tool(description = "Declare a symmetric Related edge between the Documents \
+    #[tool(
+        description = "Declare a symmetric Related edge between the Documents \
         identified by `id_a` and `id_b`. Distinct from an outgoing hyperlink \
         discovered in a Document's content: Related is a deliberate connection, \
         declared explicitly rather than discovered by extraction. A no-op if the \
-        edge already exists.")]
+        edge already exists."
+    )]
     async fn relate(
         &self,
         Parameters(params): Parameters<RelateParams>,
@@ -597,8 +611,10 @@ impl HusmoServer {
     /// (`crate::related::unrelate`), then runs the git pull/commit/push
     /// cycle around the write, per `docs/ARCHITECTURE.md` ("Git
     /// mechanics").
-    #[tool(description = "Remove the symmetric Related edge between the Documents \
-        identified by `id_a` and `id_b`, if one exists. A no-op if no edge exists.")]
+    #[tool(
+        description = "Remove the symmetric Related edge between the Documents \
+        identified by `id_a` and `id_b`, if one exists. A no-op if no edge exists."
+    )]
     async fn unrelate(
         &self,
         Parameters(params): Parameters<RelateParams>,
@@ -614,10 +630,12 @@ impl HusmoServer {
     /// `docs/ARCHITECTURE.md` ("Git mechanics", `delete`): "goes through
     /// the same git pull/commit/push cycle; nothing is truly unrecoverable
     /// since it's still in git history."
-    #[tool(description = "Delete a Document, identified by exactly one of `id`, `slug`, \
+    #[tool(
+        description = "Delete a Document, identified by exactly one of `id`, `slug`, \
         or `url`. The deletion is committed and pushed like any other write, so the \
         Document remains recoverable from the data repo's git history even though it's \
-        gone from current state. Returns the Document as it stood just before deletion.")]
+        gone from current state. Returns the Document as it stood just before deletion."
+    )]
     async fn delete(
         &self,
         Parameters(params): Parameters<DeleteParams>,
@@ -641,8 +659,8 @@ impl HusmoServer {
         .map_err(|error| ErrorData::internal_error(format!("delete task panicked: {error}"), None))?
         .map_err(|error| delete_sync_error_to_mcp_error(&error))?;
 
-        let documents =
-            store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents = store::load_all(&self.data_repo_path)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
         let related = resolve_related_refs(&documents, &deleted.related);
         Ok(Json(DocumentDto::from_document(deleted, related)))
     }
@@ -725,7 +743,9 @@ impl HusmoServer {
             let _guard = write_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            git_sync::sync_write(&sync_dir, &message, move || write(&write_dir, &write_id_a, &write_id_b))
+            git_sync::sync_write(&sync_dir, &message, move || {
+                write(&write_dir, &write_id_a, &write_id_b)
+            })
         })
         .await
         .map_err(|error| ErrorData::internal_error(format!("{verb} task panicked: {error}"), None))?
@@ -740,18 +760,26 @@ impl HusmoServer {
     /// values passed into the call) so the result always reflects what was
     /// actually committed.
     fn relate_result(&self, id_a: &str, id_b: &str) -> Result<RelateResult, ErrorData> {
-        let documents =
-            store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents = store::load_all(&self.data_repo_path)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
         let find = |id: &str| {
             documents
                 .iter()
                 .find(|document| document.id == id)
                 .cloned()
-                .ok_or_else(|| ErrorData::internal_error(format!("no Document found with id {id:?} after relate/unrelate"), None))
+                .ok_or_else(|| {
+                    ErrorData::internal_error(
+                        format!("no Document found with id {id:?} after relate/unrelate"),
+                        None,
+                    )
+                })
         };
         let document_a = Self::document_to_dto(find(id_a)?, &documents);
         let document_b = Self::document_to_dto(find(id_b)?, &documents);
-        Ok(RelateResult { document_a, document_b })
+        Ok(RelateResult {
+            document_a,
+            document_b,
+        })
     }
 }
 
@@ -796,9 +824,10 @@ fn relate_sync_error_to_mcp_error(error: &SyncError<RelateError>) -> ErrorData {
 /// [`resolve_error_to_mcp_error`].
 fn delete_sync_error_to_mcp_error(error: &SyncError<DeleteError>) -> ErrorData {
     match error {
-        SyncError::Write(DeleteError::NotFound(identifier)) => {
-            ErrorData::resource_not_found(format!("no Document found matching {identifier:?}"), None)
-        }
+        SyncError::Write(DeleteError::NotFound(identifier)) => ErrorData::resource_not_found(
+            format!("no Document found matching {identifier:?}"),
+            None,
+        ),
         other => ErrorData::internal_error(other.to_string(), None),
     }
 }
@@ -843,6 +872,14 @@ fn embeddings_error_to_mcp_error(error: &EmbeddingsError) -> ErrorData {
 /// unused, so this instructions string lives directly in
 /// [`HusmoServer::get_info`] instead of the attribute.
 #[tool_handler]
+// `ServerHandler` declares these methods `async`, so an implementation that
+// reaches nothing awaitable still has to carry the keyword. The two resource
+// methods below read from disk synchronously, and the macro's `call_tool` has
+// the same shape.
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the trait's signature fixes these as async"
+)]
 impl ServerHandler for HusmoServer {
     /// Advertises both the `tools` and `resources` capabilities. The
     /// `#[tool_handler]` macro only auto-generates `get_info` when this
@@ -876,8 +913,8 @@ impl ServerHandler for HusmoServer {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        let documents =
-            store::load_all(&self.data_repo_path).map_err(|error| store_error_to_mcp_error(&error))?;
+        let documents = store::load_all(&self.data_repo_path)
+            .map_err(|error| store_error_to_mcp_error(&error))?;
         let cursor = request.and_then(|params| params.cursor);
         let page = resources::paginate(documents, cursor.as_deref(), resources::DEFAULT_PAGE_SIZE);
 
@@ -913,11 +950,14 @@ impl ServerHandler for HusmoServer {
                 None,
             )
         })?;
-        let document = store::resolve(&self.data_repo_path, &store::Identifier::Slug(slug.to_string()))
-            .map_err(|error| resolve_error_to_mcp_error(&error))?;
+        let document = store::resolve(
+            &self.data_repo_path,
+            &store::Identifier::Slug(slug.to_string()),
+        )
+        .map_err(|error| resolve_error_to_mcp_error(&error))?;
 
-        let contents =
-            ResourceContents::text(document.to_markdown(), request.uri).with_mime_type("text/markdown");
+        let contents = ResourceContents::text(document.to_markdown(), request.uri)
+            .with_mime_type("text/markdown");
         Ok(ReadResourceResult::new(vec![contents]).into())
     }
 }
@@ -970,8 +1010,11 @@ mod tests {
             .expect("failed to push seed commit");
 
         let local_dir = tempfile::tempdir().expect("failed to create temp dir");
-        git2::Repository::clone(remote_path.to_str().expect("path is utf8"), local_dir.path())
-            .expect("failed to clone local repo");
+        git2::Repository::clone(
+            remote_path.to_str().expect("path is utf8"),
+            local_dir.path(),
+        )
+        .expect("failed to clone local repo");
         let local_path = local_dir.path().to_path_buf();
 
         (remote_dir, local_dir, local_path)
@@ -1042,7 +1085,10 @@ mod tests {
             )
             .await;
 
-        client.cancel().await.expect("client should shut down cleanly");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
         result
@@ -1067,11 +1113,18 @@ mod tests {
             .expect("save tool should return structured content");
         assert_eq!(structured["document"]["title"], "My Pasted Note");
         assert_eq!(structured["document"]["content"], "Some pasted content.");
-        assert_eq!(structured["document"]["canonical_url"], serde_json::Value::Null);
+        assert_eq!(
+            structured["document"]["canonical_url"],
+            serde_json::Value::Null
+        );
         assert_eq!(structured["outgoing_links"], serde_json::json!([]));
 
         let on_disk = crate::store::load_all(&data_repo_path).expect("load_all should succeed");
-        assert_eq!(on_disk.len(), 1, "the pasted note should have been written to the data repo");
+        assert_eq!(
+            on_disk.len(),
+            1,
+            "the pasted note should have been written to the data repo"
+        );
         assert_eq!(on_disk[0].title, "My Pasted Note");
     }
 
@@ -1098,10 +1151,17 @@ mod tests {
             .expect("save tool should return structured content");
         assert_eq!(structured["document"]["title"], "notes");
         assert_eq!(structured["document"]["content"], "Some file content.\n");
-        assert_eq!(structured["document"]["canonical_url"], serde_json::Value::Null);
+        assert_eq!(
+            structured["document"]["canonical_url"],
+            serde_json::Value::Null
+        );
 
         let on_disk = crate::store::load_all(&data_repo_path).expect("load_all should succeed");
-        assert_eq!(on_disk.len(), 1, "the ingested file should have been written to the data repo");
+        assert_eq!(
+            on_disk.len(),
+            1,
+            "the ingested file should have been written to the data repo"
+        );
     }
 
     /// Starts a one-shot HTTP server on an OS-assigned localhost port that
@@ -1301,7 +1361,10 @@ mod tests {
             )
             .await;
 
-        client.cancel().await.expect("client should shut down cleanly");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
         result
@@ -1314,16 +1377,22 @@ mod tests {
         doc.canonical_url = Some("https://example.com/post".to_string());
         crate::store::write(dir.path(), &doc).expect("write should succeed");
 
-        let by_id = call_get(dir.path().to_path_buf(), serde_json::json!({ "id": doc.id }))
-            .await
-            .expect("get by id should succeed")
-            .structured_content
-            .expect("get tool should return structured content");
-        let by_slug = call_get(dir.path().to_path_buf(), serde_json::json!({ "slug": doc.slug }))
-            .await
-            .expect("get by slug should succeed")
-            .structured_content
-            .expect("get tool should return structured content");
+        let by_id = call_get(
+            dir.path().to_path_buf(),
+            serde_json::json!({ "id": doc.id }),
+        )
+        .await
+        .expect("get by id should succeed")
+        .structured_content
+        .expect("get tool should return structured content");
+        let by_slug = call_get(
+            dir.path().to_path_buf(),
+            serde_json::json!({ "slug": doc.slug }),
+        )
+        .await
+        .expect("get by slug should succeed")
+        .structured_content
+        .expect("get tool should return structured content");
         let by_url = call_get(
             dir.path().to_path_buf(),
             serde_json::json!({ "url": "https://example.com/post" }),
@@ -1349,11 +1418,14 @@ mod tests {
         crate::store::write(dir.path(), &doc_b).expect("write should succeed");
         crate::related::relate(dir.path(), &doc_a.id, &doc_b.id).expect("relate should succeed");
 
-        let structured = call_get(dir.path().to_path_buf(), serde_json::json!({ "id": doc_a.id }))
-            .await
-            .expect("get tool call should succeed")
-            .structured_content
-            .expect("get tool should return structured content");
+        let structured = call_get(
+            dir.path().to_path_buf(),
+            serde_json::json!({ "id": doc_a.id }),
+        )
+        .await
+        .expect("get tool call should succeed")
+        .structured_content
+        .expect("get tool should return structured content");
 
         assert_eq!(
             structured["related"],
@@ -1446,7 +1518,10 @@ mod tests {
             )
             .await;
 
-        client.cancel().await.expect("client should shut down cleanly");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
         result
@@ -1471,16 +1546,25 @@ mod tests {
         .structured_content
         .expect("search-tag tool should return structured content");
 
-        assert_eq!(structured["documents"].as_array().expect("documents should be an array").len(), 1);
+        assert_eq!(
+            structured["documents"]
+                .as_array()
+                .expect("documents should be an array")
+                .len(),
+            1
+        );
         assert_eq!(structured["documents"][0]["id"], rust_doc.id);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn search_fulltext_tool_finds_an_exact_substring_match() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let matching =
-            crate::document::Document::new("Report", "Several reviewers were concerned about the plan.");
-        let unrelated = crate::document::Document::new("Unrelated", "Bake bread for forty minutes.");
+        let matching = crate::document::Document::new(
+            "Report",
+            "Several reviewers were concerned about the plan.",
+        );
+        let unrelated =
+            crate::document::Document::new("Unrelated", "Bake bread for forty minutes.");
         crate::store::write(dir.path(), &matching).expect("write should succeed");
         crate::store::write(dir.path(), &unrelated).expect("write should succeed");
 
@@ -1494,7 +1578,9 @@ mod tests {
         .structured_content
         .expect("search-fulltext tool should return structured content");
 
-        let hits = structured["hits"].as_array().expect("hits should be an array");
+        let hits = structured["hits"]
+            .as_array()
+            .expect("hits should be an array");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["document"]["id"], matching.id);
         assert_eq!(hits[0]["match_count"], 1);
@@ -1520,7 +1606,8 @@ mod tests {
         crate::embeddings::write(
             dir.path(),
             &baking_doc.slug,
-            &crate::embeddings::DocumentEmbeddings::build(&baking_doc).expect("build should succeed"),
+            &crate::embeddings::DocumentEmbeddings::build(&baking_doc)
+                .expect("build should succeed"),
         )
         .expect("write should succeed");
 
@@ -1534,7 +1621,9 @@ mod tests {
         .structured_content
         .expect("search-semantic tool should return structured content");
 
-        let hits = structured["hits"].as_array().expect("hits should be an array");
+        let hits = structured["hits"]
+            .as_array()
+            .expect("hits should be an array");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["document"]["id"], rust_doc.id);
         assert_eq!(hits[0]["expanded_related"], serde_json::json!([]));
@@ -1543,7 +1632,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn search_semantic_tool_expands_related_documents_when_asked() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let mut main_doc = crate::document::Document::new("Main", "Rust systems programming content.");
+        let mut main_doc =
+            crate::document::Document::new("Main", "Rust systems programming content.");
         let related_doc = crate::document::Document::new("Related", "More Rust content.");
         main_doc.related = vec![related_doc.id.clone()];
         crate::store::write(dir.path(), &main_doc).expect("write should succeed");
@@ -1571,7 +1661,9 @@ mod tests {
         .structured_content
         .expect("search-semantic tool should return structured content");
 
-        let hits = structured["hits"].as_array().expect("hits should be an array");
+        let hits = structured["hits"]
+            .as_array()
+            .expect("hits should be an array");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["document"]["id"], main_doc.id);
         let expanded = hits[0]["expanded_related"]
@@ -1606,9 +1698,13 @@ mod tests {
             .list_all_tools()
             .await
             .expect("list_all_tools should succeed");
-        let names: std::collections::HashSet<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
+        let names: std::collections::HashSet<_> =
+            tools.iter().map(|tool| tool.name.to_string()).collect();
 
-        client.cancel().await.expect("client should shut down cleanly");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
         for expected in ["search-semantic", "search-tag", "search-fulltext"] {
@@ -1633,13 +1729,23 @@ mod tests {
             .structured_content
             .expect("list tool should return structured content");
 
-        let documents = structured["documents"].as_array().expect("documents should be an array");
+        let documents = structured["documents"]
+            .as_array()
+            .expect("documents should be an array");
         assert_eq!(documents.len(), 2);
         let ids: std::collections::HashSet<String> = documents
             .iter()
-            .map(|doc| doc["id"].as_str().expect("id should be a string").to_string())
+            .map(|doc| {
+                doc["id"]
+                    .as_str()
+                    .expect("id should be a string")
+                    .to_string()
+            })
             .collect();
-        assert_eq!(ids, std::collections::HashSet::from([one.id.clone(), two.id.clone()]));
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from([one.id.clone(), two.id.clone()])
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1669,10 +1775,16 @@ mod tests {
         assert_eq!(structured["document_a"]["id"], doc_a.id);
         assert_eq!(structured["document_b"]["id"], doc_b.id);
 
-        let reloaded_a = crate::store::resolve(&data_repo_path, &crate::store::Identifier::Id(doc_a.id.clone()))
-            .expect("resolve should succeed");
-        let reloaded_b = crate::store::resolve(&data_repo_path, &crate::store::Identifier::Id(doc_b.id.clone()))
-            .expect("resolve should succeed");
+        let reloaded_a = crate::store::resolve(
+            &data_repo_path,
+            &crate::store::Identifier::Id(doc_a.id.clone()),
+        )
+        .expect("resolve should succeed");
+        let reloaded_b = crate::store::resolve(
+            &data_repo_path,
+            &crate::store::Identifier::Id(doc_b.id.clone()),
+        )
+        .expect("resolve should succeed");
         assert_eq!(reloaded_a.related, vec![doc_b.id.clone()]);
         assert_eq!(reloaded_b.related, vec![doc_a.id.clone()]);
     }
@@ -1753,7 +1865,8 @@ mod tests {
         let doc_b = crate::document::Document::new("B", "content b");
         crate::store::write(&data_repo_path, &doc_a).expect("write should succeed");
         crate::store::write(&data_repo_path, &doc_b).expect("write should succeed");
-        crate::related::relate(&data_repo_path, &doc_a.id, &doc_b.id).expect("relate should succeed");
+        crate::related::relate(&data_repo_path, &doc_a.id, &doc_b.id)
+            .expect("relate should succeed");
         // Committed up front, the same way a prior `save`/`relate` call
         // would have left them — `sync_write` now refuses to write onto an
         // already dirty working tree, so these need to be in HEAD before
@@ -1774,8 +1887,11 @@ mod tests {
         assert_eq!(structured["document_a"]["related"], serde_json::json!([]));
         assert_eq!(structured["document_b"]["related"], serde_json::json!([]));
 
-        let reloaded_a = crate::store::resolve(&data_repo_path, &crate::store::Identifier::Id(doc_a.id.clone()))
-            .expect("resolve should succeed");
+        let reloaded_a = crate::store::resolve(
+            &data_repo_path,
+            &crate::store::Identifier::Id(doc_a.id.clone()),
+        )
+        .expect("resolve should succeed");
         assert!(reloaded_a.related.is_empty());
     }
 
@@ -1820,7 +1936,10 @@ mod tests {
             })
             .collect();
         assert!(
-            messages.iter().any(|message| message.contains(&doc.id) || message.to_lowercase().contains("delete")),
+            messages
+                .iter()
+                .any(|message| message.contains(&doc.id)
+                    || message.to_lowercase().contains("delete")),
             "expected a commit describing the deletion, got {messages:?}"
         );
     }
@@ -1881,8 +2000,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let mut with_summary = crate::document::Document::new("With Summary", "Body content.");
         with_summary.summary = Some("A short summary.".to_string());
-        let without_summary =
-            crate::document::Document::new("Without Summary", "The body content used as a snippet.");
+        let without_summary = crate::document::Document::new(
+            "Without Summary",
+            "The body content used as a snippet.",
+        );
         crate::store::write(dir.path(), &with_summary).expect("write should succeed");
         crate::store::write(dir.path(), &without_summary).expect("write should succeed");
 
@@ -1891,12 +2012,18 @@ mod tests {
             .list_resources(None)
             .await
             .expect("resources/list should succeed");
-        client.cancel().await.expect("client should shut down cleanly");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
         assert_eq!(result.resources.len(), 2);
-        let by_uri: std::collections::HashMap<String, &rmcp::model::Resource> =
-            result.resources.iter().map(|resource| (resource.uri.clone(), resource)).collect();
+        let by_uri: std::collections::HashMap<String, &rmcp::model::Resource> = result
+            .resources
+            .iter()
+            .map(|resource| (resource.uri.clone(), resource))
+            .collect();
 
         let with_summary_uri = crate::resources::resource_uri(&with_summary.slug);
         let with_summary_resource = by_uri
@@ -1940,10 +2067,17 @@ mod tests {
             ))
             .await
             .expect("resources/list with a cursor should succeed");
-        client.cancel().await.expect("client should shut down cleanly");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
-        let uris: Vec<String> = page.resources.iter().map(|resource| resource.uri.clone()).collect();
+        let uris: Vec<String> = page
+            .resources
+            .iter()
+            .map(|resource| resource.uri.clone())
+            .collect();
         assert_eq!(uris, vec![crate::resources::resource_uri("bbb")]);
         assert_eq!(
             page.next_cursor, None,
@@ -1966,12 +2100,20 @@ mod tests {
             .read_resource(rmcp::model::ReadResourceRequestParams::new(uri.clone()))
             .await
             .expect("resources/read should succeed");
-        client.cancel().await.expect("client should shut down cleanly");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
         assert_eq!(result.contents.len(), 1);
         match &result.contents[0] {
-            rmcp::model::ResourceContents::TextResourceContents { text, mime_type, uri: content_uri, .. } => {
+            rmcp::model::ResourceContents::TextResourceContents {
+                text,
+                mime_type,
+                uri: content_uri,
+                ..
+            } => {
                 assert_eq!(content_uri, &uri);
                 assert_eq!(mime_type.as_deref(), Some("text/markdown"));
                 assert_eq!(text, &doc_a.to_markdown());
@@ -1994,7 +2136,10 @@ mod tests {
                 crate::resources::resource_uri("does-not-exist"),
             ))
             .await;
-        client.cancel().await.expect("client should shut down cleanly");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
         assert!(
@@ -2013,7 +2158,10 @@ mod tests {
                 "https://example.com/not-a-document-uri".to_string(),
             ))
             .await;
-        client.cancel().await.expect("client should shut down cleanly");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
         assert!(
@@ -2028,7 +2176,10 @@ mod tests {
 
         let (client, server_handle) = connect(dir.path().to_path_buf()).await;
         let info = client.peer_info();
-        client.cancel().await.expect("client should shut down cleanly");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
         let info = info.expect("the client should have captured the server's InitializeResult");
@@ -2062,8 +2213,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
 
         let (client, server_handle) = connect(dir.path().to_path_buf()).await;
-        let tools = client.list_all_tools().await.expect("listing tools should succeed");
-        client.cancel().await.expect("client should shut down cleanly");
+        let tools = client
+            .list_all_tools()
+            .await
+            .expect("listing tools should succeed");
+        client
+            .cancel()
+            .await
+            .expect("client should shut down cleanly");
         server_handle.await.expect("server task should not panic");
 
         let mut offenders = Vec::new();

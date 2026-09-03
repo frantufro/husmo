@@ -126,7 +126,9 @@ pub fn sync_write<T, E>(
 
     let result = write().map_err(SyncError::Write)?;
 
-    if let CommitOutcome::Committed = commit_all(&repo, message).map_err(|source| SyncError::Commit { source })? {
+    if let CommitOutcome::Committed =
+        commit_all(&repo, message).map_err(|source| SyncError::Commit { source })?
+    {
         push(&repo).map_err(|failure| match failure {
             PushFailure::Transport(source) => SyncError::Push { source },
             PushFailure::Rejected { refname, message } => {
@@ -290,7 +292,11 @@ fn commit_all(repo: &Repository, message: &str) -> Result<CommitOutcome, git2::E
     index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
     index.write()?;
     let tree_id = index.write_tree()?;
-    let parent = repo.head().ok().map(|head| head.peel_to_commit()).transpose()?;
+    let parent = repo
+        .head()
+        .ok()
+        .map(|head| head.peel_to_commit())
+        .transpose()?;
     if let Some(parent) = &parent
         && tree_id == parent.tree_id()
     {
@@ -557,7 +563,10 @@ mod tests {
             std::fs::write(local_path.join("hello.txt"), "hello\n")
         });
 
-        assert!(matches!(result, Err(crate::git_sync::SyncError::Pull { .. })));
+        assert!(matches!(
+            result,
+            Err(crate::git_sync::SyncError::Pull { .. })
+        ));
         assert!(!write_ran.get(), "write should not run when the pull fails");
         assert!(!local_path.join("hello.txt").is_file());
         assert_eq!(commit_messages(&local_path), vec!["seed".to_string()]);
@@ -694,7 +703,10 @@ mod tests {
         .expect("sync_write should succeed against a fresh, unseeded remote");
 
         assert!(local_path.join("hello.txt").is_file());
-        assert_eq!(commit_messages(&local_path), vec!["first document".to_string()]);
+        assert_eq!(
+            commit_messages(&local_path),
+            vec!["first document".to_string()]
+        );
         assert_eq!(
             read_file_from_remote_tip(&remote_path, "hello.txt"),
             Some("hello\n".to_string()),
