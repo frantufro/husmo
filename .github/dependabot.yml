@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # husmo fetches web pages, PDFs and model weights over the network and talks
+  # to remote git hosts, so advisories in reqwest, scraper, pdf-extract, git2
+  # and hf-hub land on paths that see untrusted input.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # The installer edits a file that holds provider API keys, and jsonc-parser
+  # is the one dependency doing that editing.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    ignore:
+      # The lint job pins its toolchain on purpose, and this action tags
+      # versions ahead of the rustc releases they name: a proposed 1.100.0 is
+      # something rustup answers with a 404. Move that pin by hand when a new
+      # stable is actually out.
+      - dependency-name: dtolnay/rust-toolchain
