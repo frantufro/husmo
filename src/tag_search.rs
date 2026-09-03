@@ -46,7 +46,11 @@ mod tests {
     #[test]
     fn tag_search_matches_a_document_with_multiple_tags_when_one_of_them_matches() {
         let mut doc = Document::new("Title", "content");
-        doc.tags = vec!["cooking".to_string(), "rust".to_string(), "notes".to_string()];
+        doc.tags = vec![
+            "cooking".to_string(),
+            "rust".to_string(),
+            "notes".to_string(),
+        ];
 
         let hits = tag_search(&[doc.clone()], "rust");
 

@@ -38,8 +38,8 @@ pub fn fulltext_search(documents: &[Document], query: &str) -> Vec<FullTextSearc
     let mut hits: Vec<FullTextSearchHit> = documents
         .iter()
         .filter_map(|document| {
-            let match_count =
-                count_occurrences(&document.title, query) + count_occurrences(&document.content, query);
+            let match_count = count_occurrences(&document.title, query)
+                + count_occurrences(&document.content, query);
             (match_count > 0).then(|| FullTextSearchHit {
                 document: document.clone(),
                 match_count,
@@ -47,14 +47,17 @@ pub fn fulltext_search(documents: &[Document], query: &str) -> Vec<FullTextSearc
         })
         .collect();
 
-    hits.sort_by(|a, b| b.match_count.cmp(&a.match_count));
+    hits.sort_by_key(|hit| std::cmp::Reverse(hit.match_count));
     hits
 }
 
 /// Counts non-overlapping, case-insensitive occurrences of `needle` in
 /// `haystack`.
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    haystack.to_lowercase().matches(&needle.to_lowercase()).count()
+    haystack
+        .to_lowercase()
+        .matches(&needle.to_lowercase())
+        .count()
 }
 
 #[cfg(test)]

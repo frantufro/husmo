@@ -88,11 +88,12 @@ mod tests {
         store::write(dir.path(), &doc).expect("write should succeed");
         let embeddings =
             crate::embeddings::DocumentEmbeddings::build(&doc).expect("build should succeed");
-        let sidecar_path =
-            crate::embeddings::write(dir.path(), &doc.slug, &embeddings).expect("write should succeed");
+        let sidecar_path = crate::embeddings::write(dir.path(), &doc.slug, &embeddings)
+            .expect("write should succeed");
         assert!(sidecar_path.is_file());
 
-        crate::delete::delete(dir.path(), &Identifier::Id(doc.id.clone())).expect("delete should succeed");
+        crate::delete::delete(dir.path(), &Identifier::Id(doc.id.clone()))
+            .expect("delete should succeed");
 
         assert!(!sidecar_path.is_file());
     }
@@ -112,8 +113,12 @@ mod tests {
     fn delete_errors_on_an_unknown_identifier() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
 
-        let result = crate::delete::delete(dir.path(), &Identifier::Id("nonexistent-id".to_string()));
+        let result =
+            crate::delete::delete(dir.path(), &Identifier::Id("nonexistent-id".to_string()));
 
-        assert!(matches!(result, Err(crate::delete::DeleteError::NotFound(_))));
+        assert!(matches!(
+            result,
+            Err(crate::delete::DeleteError::NotFound(_))
+        ));
     }
 }

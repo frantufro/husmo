@@ -520,7 +520,11 @@ mod tests {
             "a mailto: link isn't an archivable page, so it should not be reported as an \
              outgoing link, even though it's still rendered inline as a Markdown link"
         );
-        assert!(extracted.markdown.contains("[Email](mailto:someone@example.com)"));
+        assert!(
+            extracted
+                .markdown
+                .contains("[Email](mailto:someone@example.com)")
+        );
     }
 
     #[test]
@@ -542,7 +546,11 @@ mod tests {
             "a same-page fragment link resolves to the page's own URL, so it isn't a distinct \
              page a caller could archive as its own Document"
         );
-        assert!(extracted.markdown.contains("[Table of contents](https://example.com/post#toc)"));
+        assert!(
+            extracted
+                .markdown
+                .contains("[Table of contents](https://example.com/post#toc)")
+        );
     }
 
     #[test]
@@ -605,8 +613,10 @@ mod tests {
         );
         assert_eq!(with_main.markdown, "Main content.");
 
-        let with_only_body =
-            extract("<html><body><p>Just body content.</p></body></html>", "https://example.com/post");
+        let with_only_body = extract(
+            "<html><body><p>Just body content.</p></body></html>",
+            "https://example.com/post",
+        );
         assert_eq!(with_only_body.markdown, "Just body content.");
     }
 
@@ -618,10 +628,7 @@ mod tests {
 
         let extracted = extract(html, "https://example.com/post");
 
-        assert_eq!(
-            extracted.markdown,
-            "![A cat](https://example.com/cat.png)"
-        );
+        assert_eq!(extracted.markdown, "![A cat](https://example.com/cat.png)");
         assert_eq!(
             extracted.images,
             vec![ExtractedImage {

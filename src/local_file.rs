@@ -194,9 +194,10 @@ pub fn validate_source_path(
         })?;
 
     if let Some(roots) = &policy.allowed_source_dirs {
-        let allowed = roots
-            .iter()
-            .any(|root| root.canonicalize().is_ok_and(|root| canonical.starts_with(root)));
+        let allowed = roots.iter().any(|root| {
+            root.canonicalize()
+                .is_ok_and(|root| canonical.starts_with(root))
+        });
         return if allowed {
             Ok(canonical)
         } else {
@@ -274,7 +275,7 @@ mod tests {
     /// and saves it at `path`.
     fn write_minimal_pdf(path: &Path, text: &str) {
         use lopdf::content::{Content, Operation};
-        use lopdf::{dictionary, Document, Object, Stream};
+        use lopdf::{Document, Object, Stream, dictionary};
 
         let mut doc = Document::with_version("1.5");
         let page_tree_id = doc.new_object_id();
@@ -311,7 +312,8 @@ mod tests {
             "Resources" => resources_id,
             "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
         };
-        doc.objects.insert(page_tree_id, Object::Dictionary(page_tree));
+        doc.objects
+            .insert(page_tree_id, Object::Dictionary(page_tree));
         let catalog_id = doc.add_object(dictionary! {
             "Type" => "Catalog",
             "Pages" => page_tree_id,
@@ -377,7 +379,10 @@ mod tests {
         let canonical = validate_source_path(&path, &PathPolicy::default())
             .expect("validate_source_path should succeed with no policy configured");
 
-        assert_eq!(canonical, path.canonicalize().expect("path should canonicalize"));
+        assert_eq!(
+            canonical,
+            path.canonicalize().expect("path should canonicalize")
+        );
     }
 
     #[test]
@@ -393,7 +398,10 @@ mod tests {
 
         let result = validate_source_path(&path, &policy);
 
-        assert!(matches!(result, Err(PathRestrictionError::OutsideAllowedDirs { .. })));
+        assert!(matches!(
+            result,
+            Err(PathRestrictionError::OutsideAllowedDirs { .. })
+        ));
     }
 
     #[test]
@@ -409,7 +417,10 @@ mod tests {
         let canonical = validate_source_path(&path, &policy)
             .expect("validate_source_path should succeed for a path under an allowed root");
 
-        assert_eq!(canonical, path.canonicalize().expect("path should canonicalize"));
+        assert_eq!(
+            canonical,
+            path.canonicalize().expect("path should canonicalize")
+        );
     }
 
     #[test]
@@ -426,7 +437,10 @@ mod tests {
 
         let result = validate_source_path(&path, &policy);
 
-        assert!(matches!(result, Err(PathRestrictionError::WellKnownSecretDir { .. })));
+        assert!(matches!(
+            result,
+            Err(PathRestrictionError::WellKnownSecretDir { .. })
+        ));
     }
 
     #[test]
@@ -439,11 +453,13 @@ mod tests {
             home: Some(home_dir.path().to_path_buf()),
         };
 
-        let canonical = validate_source_path(&path, &policy).expect(
-            "validate_source_path should succeed for a path outside the default deny-list",
-        );
+        let canonical = validate_source_path(&path, &policy)
+            .expect("validate_source_path should succeed for a path outside the default deny-list");
 
-        assert_eq!(canonical, path.canonicalize().expect("path should canonicalize"));
+        assert_eq!(
+            canonical,
+            path.canonicalize().expect("path should canonicalize")
+        );
     }
 
     #[test]
@@ -453,6 +469,9 @@ mod tests {
 
         let result = validate_source_path(&path, &PathPolicy::default());
 
-        assert!(matches!(result, Err(PathRestrictionError::Canonicalize { .. })));
+        assert!(matches!(
+            result,
+            Err(PathRestrictionError::Canonicalize { .. })
+        ));
     }
 }
