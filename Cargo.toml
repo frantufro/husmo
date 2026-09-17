@@ -55,7 +55,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
 schemars = "1.0"
 
 [dev-dependencies]
-lopdf = "0.44.0"
+lopdf = "0.45.0"
 tempfile = "3"
 # Only "client" is added here: it lets tests drive the MCP server through a
 # real client/server round trip (see `src/mcp_server.rs`'s tests). Everything
