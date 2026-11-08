@@ -108,7 +108,7 @@ mod tests {
 
         let hits = fulltext_search(&[doc], "nonexistent-phrase");
 
-        assert!(hits.is_empty());
+        assert_eq!(hits, []);
     }
 
     #[test]
@@ -117,7 +117,7 @@ mod tests {
 
         let hits = fulltext_search(&[doc], "   ");
 
-        assert!(hits.is_empty());
+        assert_eq!(hits, []);
     }
 
     #[test]

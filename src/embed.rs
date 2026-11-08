@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
-use hf_hub::api::sync::{ApiBuilder, ApiError};
+use hf_hub::{HFClientSync, HFError};
 use tokenizers::{Tokenizer, TruncationParams};
 
 /// Hugging Face Hub id of the pre-trained sentence-embedding model this
@@ -70,7 +70,7 @@ fn model() -> Result<&'static Model, EmbedError> {
 pub enum LoadModelError {
     /// The Hugging Face Hub API client could not be created.
     #[error("failed to create the Hugging Face Hub API client: {0}")]
-    HubClient(#[source] ApiError),
+    HubClient(#[source] HFError),
     /// One of the model's files could not be fetched or read from the
     /// local Hugging Face Hub cache.
     #[error("failed to fetch/cache the embedding model's {file}: {source}")]
@@ -79,7 +79,7 @@ pub enum LoadModelError {
         file: &'static str,
         /// The underlying fetch failure.
         #[source]
-        source: ApiError,
+        source: HFError,
     },
     /// The model's `config.json` could not be read from disk.
     #[error("failed to read the embedding model's config.json: {0}")]
@@ -110,9 +110,8 @@ pub enum LoadModelError {
 /// across every process on a machine performs any network I/O; every later
 /// one, including in future runs, reads that local cache instead.
 ///
-/// The client is built through `ApiBuilder::from_env`, which is what reads
-/// `HF_HOME` for the cache location and `HF_ENDPOINT` for a mirror of the
-/// Hub. `ApiBuilder::new` consults neither.
+/// The client is built through `HFClientSync::new`, which reads `HF_HOME`
+/// for the cache location and `HF_ENDPOINT` for a mirror of the Hub.
 ///
 /// # Errors
 ///
@@ -120,25 +119,31 @@ pub enum LoadModelError {
 /// their contents don't parse as the expected BERT config, tokenizer, or
 /// safetensors weights.
 fn load_model() -> Result<Model, LoadModelError> {
-    let repo = ApiBuilder::from_env()
-        .build()
+    let (owner, name) = hf_hub::split_id(MODEL_ID);
+    let repo = HFClientSync::new()
         .map_err(LoadModelError::HubClient)?
-        .model(MODEL_ID.to_string());
+        .model(owner, name);
 
     let config_path = repo
-        .get("config.json")
+        .download_file()
+        .filename("config.json")
+        .send()
         .map_err(|source| LoadModelError::Fetch {
             file: "config.json",
             source,
         })?;
     let tokenizer_path = repo
-        .get("tokenizer.json")
+        .download_file()
+        .filename("tokenizer.json")
+        .send()
         .map_err(|source| LoadModelError::Fetch {
             file: "tokenizer.json",
             source,
         })?;
     let weights_path = repo
-        .get("model.safetensors")
+        .download_file()
+        .filename("model.safetensors")
+        .send()
         .map_err(|source| LoadModelError::Fetch {
             file: "model.safetensors",
             source,

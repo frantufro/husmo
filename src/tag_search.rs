@@ -36,11 +36,11 @@ mod tests {
     #[test]
     fn tag_search_excludes_a_document_with_zero_tags() {
         let doc = Document::new("Title", "content");
-        assert!(doc.tags.is_empty());
+        assert_eq!(doc.tags, Vec::<String>::new());
 
         let hits = tag_search(&[doc], "rust");
 
-        assert!(hits.is_empty());
+        assert_eq!(hits, []);
     }
 
     #[test]
@@ -64,7 +64,7 @@ mod tests {
 
         let hits = tag_search(&[doc], "rust");
 
-        assert!(hits.is_empty());
+        assert_eq!(hits, []);
     }
 
     #[test]
@@ -89,6 +89,6 @@ mod tests {
 
         let hits = tag_search(&[doc], "rust");
 
-        assert!(hits.is_empty());
+        assert_eq!(hits, []);
     }
 }

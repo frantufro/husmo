@@ -148,8 +148,8 @@ mod tests {
 
         let reloaded_a = reload(dir.path(), &doc_a.id);
         let reloaded_b = reload(dir.path(), &doc_b.id);
-        assert!(reloaded_a.related.is_empty());
-        assert!(reloaded_b.related.is_empty());
+        assert_eq!(reloaded_a.related, Vec::<String>::new());
+        assert_eq!(reloaded_b.related, Vec::<String>::new());
     }
 
     #[test]
@@ -163,7 +163,7 @@ mod tests {
         unrelate(dir.path(), &doc_a.id, &doc_b.id).expect("unrelate should succeed");
 
         let reloaded_a = reload(dir.path(), &doc_a.id);
-        assert!(reloaded_a.related.is_empty());
+        assert_eq!(reloaded_a.related, Vec::<String>::new());
     }
 
     #[test]

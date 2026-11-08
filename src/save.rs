@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(output.document.title, "My Pasted Note");
         assert_eq!(output.document.content, "Some pasted content.");
         assert_eq!(output.document.canonical_url, None);
-        assert!(output.outgoing_links.is_empty());
+        assert_eq!(output.outgoing_links, []);
 
         let on_disk = crate::store::resolve(
             dir.path(),
@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(output.document.content, "Some file content.\n");
         assert_eq!(output.document.canonical_url, None);
         assert_eq!(output.document.title, "notes");
-        assert!(output.outgoing_links.is_empty());
+        assert_eq!(output.outgoing_links, []);
     }
 
     #[test]

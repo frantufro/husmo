@@ -19,7 +19,7 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
     Implementation, ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams,
     ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
-    ServerInfo,
+    ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -888,8 +888,8 @@ impl ServerHandler for HusmoServer {
     /// add for Documents' resources to be advertised at all, since a
     /// resource-aware client checks capabilities before ever calling
     /// `resources/list`.
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -980,8 +980,8 @@ mod tests {
     struct TestClient;
 
     impl ClientHandler for TestClient {
-        fn get_info(&self) -> rmcp::model::ClientInfo {
-            rmcp::model::ClientInfo::default()
+        fn get_info(&self) -> rmcp::model::ClientConfig {
+            rmcp::model::ClientConfig::default()
         }
     }
 
@@ -1892,7 +1892,7 @@ mod tests {
             &crate::store::Identifier::Id(doc_a.id.clone()),
         )
         .expect("resolve should succeed");
-        assert!(reloaded_a.related.is_empty());
+        assert_eq!(reloaded_a.related, Vec::<String>::new());
     }
 
     #[tokio::test(flavor = "multi_thread")]
