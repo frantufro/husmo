@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].document.id, main_doc.id);
         assert_eq!(hits[0].document.related, vec![related_doc.id.clone()]);
-        assert!(hits[0].expanded_related.is_empty());
+        assert_eq!(hits[0].expanded_related, []);
     }
 
     #[test]
@@ -223,6 +223,6 @@ mod tests {
             .expect("semantic_search should succeed");
 
         assert_eq!(hits.len(), 1);
-        assert!(hits[0].expanded_related.is_empty());
+        assert_eq!(hits[0].expanded_related, []);
     }
 }
