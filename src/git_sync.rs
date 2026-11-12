@@ -198,13 +198,96 @@ enum CommitOutcome {
     NoChanges,
 }
 
+/// Private-key files husmo tries for SSH remotes, relative to `$HOME`, in
+/// the order they are attempted.
+const DEFAULT_SSH_KEYS: &[&str] = &[".ssh/id_ed25519", ".ssh/id_ecdsa", ".ssh/id_rsa"];
+
+/// The default private-key files that exist under `home`, in attempt order.
+fn default_ssh_key_paths(home: &Path) -> Vec<PathBuf> {
+    DEFAULT_SSH_KEYS
+        .iter()
+        .map(|relative| home.join(relative))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+/// Walks the SSH credential sources one per call. libgit2 invokes the
+/// credentials callback again after every rejected credential, so each call
+/// must hand out something new or the connection would retry forever.
+struct SshCredentials {
+    /// Whether the ssh-agent attempt is still to be made.
+    try_agent: bool,
+    /// Key files not yet attempted, in attempt order.
+    keys: std::vec::IntoIter<PathBuf>,
+    /// Every key file attempted so far, for the final error message.
+    tried: Vec<PathBuf>,
+}
+
+impl SshCredentials {
+    /// `agent_available` is whether an ssh-agent socket is advertised
+    /// (`SSH_AUTH_SOCK`). Without one libgit2 aborts the whole connection
+    /// on the agent attempt, so it is skipped and the key files get their
+    /// turn.
+    fn new(agent_available: bool, keys: Vec<PathBuf>) -> Self {
+        Self {
+            try_agent: agent_available,
+            keys: keys.into_iter(),
+            tried: Vec::new(),
+        }
+    }
+
+    fn next(&mut self, username: &str) -> Result<git2::Cred, git2::Error> {
+        if self.try_agent {
+            self.try_agent = false;
+            if let Ok(credential) = git2::Cred::ssh_key_from_agent(username) {
+                return Ok(credential);
+            }
+        }
+        for key in self.keys.by_ref() {
+            self.tried.push(key.clone());
+            if let Ok(credential) = git2::Cred::ssh_key(username, None, &key, None) {
+                return Ok(credential);
+            }
+        }
+        Err(git2::Error::from_str(&self.exhausted_message()))
+    }
+
+    fn exhausted_message(&self) -> String {
+        if self.tried.is_empty() {
+            "SSH authentication failed: no ssh-agent identity was accepted and none of \
+             ~/.ssh/id_ed25519, ~/.ssh/id_ecdsa or ~/.ssh/id_rsa exists; start an \
+             ssh-agent with a loaded key or create a passphrase-less key in ~/.ssh"
+                .to_string()
+        } else {
+            let tried: Vec<String> = self
+                .tried
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            format!(
+                "SSH authentication failed: the ssh-agent (if any) and these key files \
+                 were not accepted: {}; keys with a passphrase are not supported, so \
+                 load them into an ssh-agent or use a passphrase-less key",
+                tried.join(", ")
+            )
+        }
+    }
+}
+
 /// Builds the remote callbacks used for fetch, push, and (via
-/// [`crate::init`]) the initial clone: an SSH key from the running
-/// ssh-agent for `git+ssh` remotes, falling back to a system credential
-/// helper (covers HTTPS remotes with a stored token/password) and finally
-/// to whatever default credential git2 can produce. Remotes that need no
-/// authentication at all (e.g. a local `file://` path, as in the tests)
-/// never invoke this.
+/// [`crate::init`]) the initial clone. For `git+ssh` remotes the
+/// credentials are tried in this order: a key from the running ssh-agent
+/// (only when `SSH_AUTH_SOCK` is set), then the key files `~/.ssh/id_ed25519`,
+/// `~/.ssh/id_ecdsa` and `~/.ssh/id_rsa` that exist, without a passphrase.
+/// When none is accepted the error names the key files tried. For other
+/// remotes (HTTPS with a stored token/password) it uses a system credential
+/// helper and finally whatever default credential git2 can produce. Remotes
+/// that need no authentication at all (e.g. a local `file://` path, as in
+/// the tests) never invoke this.
+///
+/// libgit2 does not read `~/.ssh/config`, so `Port` and `IdentityFile`
+/// entries have no effect: a non-standard port needs an `ssh://` URL that
+/// carries it.
 ///
 /// `repo` supplies the git config the credential helper is read from, when
 /// one is already open (the normal `pull`/`push` case). `husmo init` calls
@@ -214,12 +297,20 @@ enum CommitOutcome {
 /// helper for a fresh clone would be configured anyway.
 pub(crate) fn remote_callbacks(repo: Option<&Repository>) -> git2::RemoteCallbacks<'_> {
     let mut callbacks = git2::RemoteCallbacks::new();
+    let mut ssh: Option<SshCredentials> = None;
     callbacks.credentials(move |url, username_from_url, allowed_types| {
         if allowed_types.contains(git2::CredentialType::SSH_KEY)
             && let Some(username) = username_from_url
-            && let Ok(credential) = git2::Cred::ssh_key_from_agent(username)
         {
-            return Ok(credential);
+            let ssh = ssh.get_or_insert_with(|| {
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                SshCredentials::new(
+                    std::env::var_os("SSH_AUTH_SOCK").is_some_and(|sock| !sock.is_empty()),
+                    home.map(|home| default_ssh_key_paths(&home))
+                        .unwrap_or_default(),
+                )
+            });
+            return ssh.next(username);
         }
         let config = match repo {
             Some(repo) => repo.config(),
@@ -374,6 +465,56 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::test_support::{empty_bare_remote, seeded_bare_remote};
+
+    use super::{SshCredentials, default_ssh_key_paths};
+
+    fn home_with_keys(names: &[&str]) -> TempDir {
+        let home = tempfile::tempdir().expect("failed to create temp dir");
+        let ssh_dir = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).expect("failed to create .ssh dir");
+        for name in names {
+            std::fs::write(ssh_dir.join(name), "key").expect("failed to write key");
+        }
+        home
+    }
+
+    #[test]
+    fn default_ssh_key_paths_lists_existing_keys_in_attempt_order() {
+        let home = home_with_keys(&["id_rsa", "id_ed25519", "id_other"]);
+        let paths = default_ssh_key_paths(home.path());
+        assert_eq!(
+            paths,
+            vec![
+                home.path().join(".ssh/id_ed25519"),
+                home.path().join(".ssh/id_rsa")
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_credentials_hand_out_each_key_once_then_name_them_in_the_error() {
+        let home = home_with_keys(&["id_ed25519", "id_rsa"]);
+        let mut ssh = SshCredentials::new(false, default_ssh_key_paths(home.path()));
+        for _ in 0..2 {
+            let credential = ssh.next("git").expect("a key file should be offered");
+            assert_eq!(credential.credtype(), git2::CredentialType::SSH_KEY.bits());
+        }
+        let message = ssh
+            .next("git")
+            .err()
+            .expect("keys are exhausted")
+            .to_string();
+        assert!(message.contains("id_ed25519"), "{message}");
+        assert!(message.contains("id_rsa"), "{message}");
+        assert!(ssh.next("git").is_err());
+    }
+
+    #[test]
+    fn ssh_credentials_without_keys_explain_what_to_set_up() {
+        let mut ssh = SshCredentials::new(false, Vec::new());
+        let message = ssh.next("git").err().expect("nothing to offer").to_string();
+        assert!(message.contains("~/.ssh/id_ed25519"), "{message}");
+    }
 
     /// Clones `remote_path` into a fresh temp dir, returning the clone.
     fn clone_local(remote_path: &Path) -> (TempDir, std::path::PathBuf) {
