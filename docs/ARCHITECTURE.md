@@ -115,23 +115,23 @@ No manual commit step. Single machine for now — the pull-first step is a
 forward-looking safety habit, not a full multi-machine conflict-resolution
 system.
 
+This is distinct from the app repo's own normal development git history —
+don't conflate the two.
+
 ### Remote authentication
 
-For SSH remotes husmo tries, in order: a key from the running ssh-agent (only
-when `SSH_AUTH_SOCK` is set), then the key files `~/.ssh/id_ed25519`,
-`~/.ssh/id_ecdsa` and `~/.ssh/id_rsa` that exist, without a passphrase. Keys
-with a passphrase fail and the next candidate is tried. When none is
-accepted the error names the key files tried. HTTPS remotes use the git
-credential helper, then git2's default credential. `file://` remotes need no
-credentials.
+For SSH remotes husmo tries, in order: a key from the running ssh-agent, then
+the key files `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa` and `~/.ssh/id_rsa` that
+exist. Passphrase-protected key files are skipped, because libgit2 aborts the
+connection when given one without its passphrase; load such a key into an
+ssh-agent instead. When none is accepted the error names the key files tried
+and skipped. HTTPS remotes use the git credential helper, then git2's default
+credential. `file://` remotes need no credentials.
 
 libgit2 does not read `~/.ssh/config`, so `Port` and `IdentityFile` entries
 have no effect. A remote on a non-standard port needs an `ssh://` URL that
 carries the port, for example `ssh://git@host:2222/owner/repo.git`. The short
 form `git@host:owner/repo.git` connects to port 22.
-
-This is distinct from the app repo's own normal development git history —
-don't conflate the two.
 
 ## MCP server
 

@@ -211,6 +211,75 @@ fn default_ssh_key_paths(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Whether the private key at `path` is encrypted with a passphrase.
+///
+/// libgit2 aborts the whole connection with a hard error when handed an
+/// encrypted key and no passphrase, so such keys must be filtered out
+/// before they are offered. Recognizes both the OpenSSH format (cipher name
+/// other than `none`) and legacy PEM files (`ENCRYPTED` header). A file that
+/// cannot be read or parsed counts as unprotected and is left to libgit2 to
+/// accept or reject.
+fn is_passphrase_protected(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if text.contains("ENCRYPTED") {
+        return true;
+    }
+    let Some(body) = text
+        .strip_prefix("-----BEGIN OPENSSH PRIVATE KEY-----")
+        .map(str::trim_start)
+    else {
+        return false;
+    };
+    // The cipher name sits in the first 15 + 4 + 16 bytes at most: the
+    // "openssh-key-v1\0" magic, a u32 length and the name. 64 base64
+    // characters decode to 48 bytes, which covers it.
+    let head: Vec<u8> = body
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .take(64)
+        .collect();
+    let bytes = decode_base64_prefix(&head);
+    let Some(rest) = bytes.strip_prefix(b"openssh-key-v1\0") else {
+        return false;
+    };
+    let Some((length, rest)) = rest.split_first_chunk::<4>() else {
+        return false;
+    };
+    let length = u32::from_be_bytes(*length) as usize;
+    match rest.get(..length) {
+        Some(cipher) => cipher != b"none",
+        None => false,
+    }
+}
+
+/// Decodes standard base64 characters into bytes, stopping at the first
+/// character outside the alphabet (such as `=` padding). A trailing partial
+/// group yields its complete bytes.
+fn decode_base64_prefix(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let mut accumulator: u32 = 0;
+    let mut bits = 0;
+    for &byte in text {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => break,
+        };
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(u8::try_from((accumulator >> bits) & 0xff).unwrap_or(0));
+        }
+    }
+    out
+}
+
 /// Walks the SSH credential sources one per call. libgit2 invokes the
 /// credentials callback again after every rejected credential, so each call
 /// must hand out something new or the connection would retry forever.
@@ -221,18 +290,17 @@ struct SshCredentials {
     keys: std::vec::IntoIter<PathBuf>,
     /// Every key file attempted so far, for the final error message.
     tried: Vec<PathBuf>,
+    /// Key files passed over because they need a passphrase.
+    skipped: Vec<PathBuf>,
 }
 
 impl SshCredentials {
-    /// `agent_available` is whether an ssh-agent socket is advertised
-    /// (`SSH_AUTH_SOCK`). Without one libgit2 aborts the whole connection
-    /// on the agent attempt, so it is skipped and the key files get their
-    /// turn.
-    fn new(agent_available: bool, keys: Vec<PathBuf>) -> Self {
+    fn new(keys: Vec<PathBuf>) -> Self {
         Self {
-            try_agent: agent_available,
+            try_agent: true,
             keys: keys.into_iter(),
             tried: Vec::new(),
+            skipped: Vec::new(),
         }
     }
 
@@ -244,6 +312,10 @@ impl SshCredentials {
             }
         }
         for key in self.keys.by_ref() {
+            if is_passphrase_protected(&key) {
+                self.skipped.push(key);
+                continue;
+            }
             self.tried.push(key.clone());
             if let Ok(credential) = git2::Cred::ssh_key(username, None, &key, None) {
                 return Ok(credential);
@@ -253,33 +325,47 @@ impl SshCredentials {
     }
 
     fn exhausted_message(&self) -> String {
-        if self.tried.is_empty() {
-            "SSH authentication failed: no ssh-agent identity was accepted and none of \
-             ~/.ssh/id_ed25519, ~/.ssh/id_ecdsa or ~/.ssh/id_rsa exists; start an \
-             ssh-agent with a loaded key or create a passphrase-less key in ~/.ssh"
-                .to_string()
-        } else {
-            let tried: Vec<String> = self
-                .tried
+        let list = |paths: &[PathBuf]| {
+            paths
                 .iter()
                 .map(|path| path.display().to_string())
-                .collect();
-            format!(
-                "SSH authentication failed: the ssh-agent (if any) and these key files \
-                 were not accepted: {}; keys with a passphrase are not supported, so \
-                 load them into an ssh-agent or use a passphrase-less key",
-                tried.join(", ")
-            )
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut parts =
+            vec!["SSH authentication failed: no ssh-agent identity was accepted".to_string()];
+        if !self.tried.is_empty() {
+            parts.push(format!(
+                "these key files were not accepted: {}",
+                list(&self.tried)
+            ));
         }
+        if !self.skipped.is_empty() {
+            parts.push(format!(
+                "these key files need a passphrase, which husmo cannot supply, so load \
+                 them into an ssh-agent: {}",
+                list(&self.skipped)
+            ));
+        }
+        if self.tried.is_empty() && self.skipped.is_empty() {
+            parts.push(
+                "none of ~/.ssh/id_ed25519, ~/.ssh/id_ecdsa or ~/.ssh/id_rsa exists, \
+                 so start an ssh-agent with a loaded key or create a passphrase-less \
+                 key in ~/.ssh"
+                    .to_string(),
+            );
+        }
+        parts.join("; ")
     }
 }
 
 /// Builds the remote callbacks used for fetch, push, and (via
 /// [`crate::init`]) the initial clone. For `git+ssh` remotes the
-/// credentials are tried in this order: a key from the running ssh-agent
-/// (only when `SSH_AUTH_SOCK` is set), then the key files `~/.ssh/id_ed25519`,
-/// `~/.ssh/id_ecdsa` and `~/.ssh/id_rsa` that exist, without a passphrase.
-/// When none is accepted the error names the key files tried. For other
+/// credentials are tried in this order: a key from the running ssh-agent,
+/// then the key files `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa` and
+/// `~/.ssh/id_rsa` that exist and need no passphrase. Passphrase-protected
+/// keys are skipped. When none is accepted the error names the key files
+/// tried and skipped. For other
 /// remotes (HTTPS with a stored token/password) it uses a system credential
 /// helper and finally whatever default credential git2 can produce. Remotes
 /// that need no authentication at all (e.g. a local `file://` path, as in
@@ -305,7 +391,6 @@ pub(crate) fn remote_callbacks(repo: Option<&Repository>) -> git2::RemoteCallbac
             let ssh = ssh.get_or_insert_with(|| {
                 let home = std::env::var_os("HOME").map(PathBuf::from);
                 SshCredentials::new(
-                    std::env::var_os("SSH_AUTH_SOCK").is_some_and(|sock| !sock.is_empty()),
                     home.map(|home| default_ssh_key_paths(&home))
                         .unwrap_or_default(),
                 )
@@ -466,7 +551,15 @@ mod tests {
 
     use crate::test_support::{empty_bare_remote, seeded_bare_remote};
 
-    use super::{SshCredentials, default_ssh_key_paths};
+    use super::{SshCredentials, default_ssh_key_paths, is_passphrase_protected};
+
+    /// Credentials with the agent attempt switched off: constructing an agent
+    /// credential always succeeds, so tests would otherwise get it first.
+    fn key_only(keys: Vec<std::path::PathBuf>) -> SshCredentials {
+        let mut ssh = SshCredentials::new(keys);
+        ssh.try_agent = false;
+        ssh
+    }
 
     fn home_with_keys(names: &[&str]) -> TempDir {
         let home = tempfile::tempdir().expect("failed to create temp dir");
@@ -494,7 +587,7 @@ mod tests {
     #[test]
     fn ssh_credentials_hand_out_each_key_once_then_name_them_in_the_error() {
         let home = home_with_keys(&["id_ed25519", "id_rsa"]);
-        let mut ssh = SshCredentials::new(false, default_ssh_key_paths(home.path()));
+        let mut ssh = key_only(default_ssh_key_paths(home.path()));
         for _ in 0..2 {
             let credential = ssh.next("git").expect("a key file should be offered");
             assert_eq!(credential.credtype(), git2::CredentialType::SSH_KEY.bits());
@@ -509,9 +602,48 @@ mod tests {
         assert!(ssh.next("git").is_err());
     }
 
+    fn key_file(contents: &str) -> (TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("id_test");
+        std::fs::write(&path, contents).expect("failed to write key");
+        (dir, path)
+    }
+
+    #[test]
+    fn is_passphrase_protected_recognizes_openssh_and_pem_encryption() {
+        let (_a, unencrypted) = key_file(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEYmNyeXB0AAAAAAAAAAAAAAAAAAAAAAAAAA\nA=\n-----END OPENSSH PRIVATE KEY-----\n",
+        );
+        let (_b, encrypted) = key_file(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAEYmNyeXB0AAAAAAAAAAAAAAAAAA\nAAAAAAAAA=\n-----END OPENSSH PRIVATE KEY-----\n",
+        );
+        let (_c, legacy) = key_file(
+            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nAAAA\n-----END RSA PRIVATE KEY-----\n",
+        );
+        let (_d, plain_pem) =
+            key_file("-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\n");
+        assert!(!is_passphrase_protected(&unencrypted));
+        assert!(is_passphrase_protected(&encrypted));
+        assert!(is_passphrase_protected(&legacy));
+        assert!(!is_passphrase_protected(&plain_pem));
+        assert!(!is_passphrase_protected(Path::new("/nonexistent/key")));
+    }
+
+    #[test]
+    fn ssh_credentials_skip_passphrase_keys_and_say_so_in_the_error() {
+        let home = tempfile::tempdir().expect("failed to create temp dir");
+        let ssh_dir = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).expect("failed to create .ssh dir");
+        std::fs::write(ssh_dir.join("id_ed25519"), "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAEYmNyeXB0AAAAAAAAAAAAAAAAAA\nAAAAAAAAA=\n-----END OPENSSH PRIVATE KEY-----\n").expect("failed to write key");
+        let mut ssh = key_only(default_ssh_key_paths(home.path()));
+        let message = ssh.next("git").err().expect("nothing usable").to_string();
+        assert!(message.contains("need a passphrase"), "{message}");
+        assert!(message.contains("id_ed25519"), "{message}");
+    }
+
     #[test]
     fn ssh_credentials_without_keys_explain_what_to_set_up() {
-        let mut ssh = SshCredentials::new(false, Vec::new());
+        let mut ssh = key_only(Vec::new());
         let message = ssh.next("git").err().expect("nothing to offer").to_string();
         assert!(message.contains("~/.ssh/id_ed25519"), "{message}");
     }
