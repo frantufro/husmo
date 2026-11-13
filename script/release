@@ -179,15 +179,39 @@ Set $version in Cargo.toml, package.json, the Claude Code plugin manifest
 and the README sample, and refresh Cargo.lock.
 EOF
 
+# The release PR body lists what changed since the previous tag. It lives
+# under .git so the working tree stays clean. Task-board commits (cubil:) and
+# earlier release commits are left out.
+notes=.git/release-notes-v$version.md
+previous=$(git describe --tags --abbrev=0 --match 'v*' "main" 2>/dev/null || true)
+{
+  printf '## What is in %s\n\n' "$version"
+  if [ -n "$previous" ]; then
+    log=$(git log --no-merges --format='- %s (%h)' "$previous..main" \
+      | grep -v -e '^- chore: release ' -e '^- cubil: ' || true)
+  else
+    log=
+  fi
+  printf '%s\n' "${log:-- No changes since ${previous:-the first commit}.}"
+  if [ -n "$previous" ]; then
+    printf '\nFull diff: https://github.com/frantufro/husmo/compare/%s...v%s\n' "$previous" "$version"
+  fi
+} > "$notes"
+
 cat <<EOF
 
-committed on release/v$version. To finish:
+committed on release/v$version. Changes since ${previous:-the start}:
 
-  gh pr create --fill
+$(sed '1,2d' "$notes")
+
+To finish:
+
+  gh pr create --title "chore: release $version" --body-file $notes
   gh pr merge --squash --delete-branch
   git checkout main && git pull
   git tag v$version && git push origin v$version
 
 The last line starts the release workflow, which publishes the GitHub
-release, the Homebrew formula and @frantufro/husmo@$version.
+release (with notes generated from the merged PRs), the Homebrew formula and
+@frantufro/husmo@$version.
 EOF
