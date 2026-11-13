@@ -5,23 +5,246 @@ retrieve content, with a Rust MCP server as its interface.
 
 ## Quick start
 
-On OpenCode, one command installs the skill, registers the MCP server, and
-fetches the binary if you don't have it:
+Three steps: install the binary, create the data repo, connect your agent.
+The full design is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and the domain
+glossary in [`CONTEXT.md`](CONTEXT.md).
+
+### 1. Install the binary
 
 ```sh
-npx @frantufro/husmo install
+curl -sSL https://raw.githubusercontent.com/frantufro/husmo/main/install.sh | sh
 ```
 
-Then create the data repo your Documents will live in:
+Homebrew (macOS and Linux) works too:
+
+```sh
+brew install frantufro/tap/husmo
+```
+
+To build from source, clone the repo and run `cargo install --path .`.
+
+The script installs to `~/.local/bin`. Add `export PATH="$HOME/.local/bin:$PATH"`
+to your shell config if that directory is missing from your `PATH`.
+
+### 2. Create the data repo
+
+Your Documents live in a git repo of their own (see "Repo split" below). Create
+an empty one on your git host, then clone it with husmo:
 
 ```sh
 cd wherever/you/want/the/data/repo
 husmo init --repo git@github.com:you/husmo-data.git
 ```
 
-Restart OpenCode and ask it to save a page. The details, the project-scoped
-variant, and the by-hand equivalent are in
-["Use husmo from OpenCode"](#use-husmo-from-opencode) below.
+`husmo init` clones the repo into the current directory and writes the config
+file that points husmo at it. Remotes over SSH authenticate with your
+ssh-agent first, then with `~/.ssh/id_ed25519`, `id_ecdsa` or `id_rsa`. A
+remote on a non-standard port needs an `ssh://` URL that carries the port,
+for example `ssh://git@host:2222/you/husmo-data.git`.
+
+### 3. Connect your agent
+
+husmo is an MCP server: `husmo` with no arguments speaks MCP over stdio. Pick
+your agent. Each block registers the server and, where the agent supports it,
+adds the skill that teaches the agent when to save a page and how to triage
+the outgoing links `save` reports.
+
+<details>
+<summary><b>Claude Code</b></summary>
+
+```
+/plugin marketplace add frantufro/claude-plugins
+/plugin install husmo@frantufro-plugins
+```
+
+The plugin carries the skill and an MCP declaration that runs `husmo` from
+your `PATH`. Restart Claude Code.
+
+The first `save` downloads about 90MB of embedding-model weights. If it times
+out, raise Claude Code's MCP timeouts and restart:
+
+```sh
+export MCP_TIMEOUT=120000
+export MCP_TOOL_TIMEOUT=120000
+```
+
+</details>
+
+<details>
+<summary><b>OpenCode</b></summary>
+
+```sh
+npx @frantufro/husmo install
+```
+
+One command installs the skill (`~/.config/opencode/skills/`), registers the
+MCP server in `~/.config/opencode/opencode.json`, and downloads the binary
+when `husmo` is missing from your `PATH`, so it also covers step 1:
+
+```
+  ✓ skill   installed  ~/.config/opencode/skills/husmo-document-management
+  ✓ binary  downloaded husmo 0.1.4 to ~/.local/bin/husmo
+  ✓ mcp     registered husmo in  ~/.config/opencode/opencode.json
+  → data    no config at ~/.config/husmo/config.toml
+    create a data repo before using husmo's tools:
+      cd wherever/you/want/the/data/repo
+      husmo init --repo git@github.com:you/husmo-data.git
+
+  restart OpenCode to pick up the skill and the husmo tools.
+```
+
+Restart OpenCode afterwards.
+
+For one project only, run `npx @frantufro/husmo install --project`. It writes
+`./.opencode/skills/` and `./opencode.json`, both safe to commit.
+
+Other flags: `--force` overwrites without asking, `--skip-existing` keeps what
+is there, `--no-binary` skips the download, and `--dry-run` reports every
+action and writes nothing. Re-running the installer is safe.
+
+To register the server by hand (OpenCode 1.18 and later):
+
+```sh
+opencode mcp add husmo -- husmo
+```
+
+or add this to the `mcp` block of `opencode.json`:
+
+```jsonc
+"husmo": { "type": "local", "command": ["husmo"], "timeout": 120000 }
+```
+
+The `timeout` of 120 seconds covers the first `save`, which downloads the
+embedding-model weights. Verify with `opencode mcp list`; a `husmo connected`
+row means the server runs.
+
+</details>
+
+<details>
+<summary><b>Codex</b></summary>
+
+Register the server:
+
+```sh
+codex mcp add husmo -- husmo
+```
+
+Raise the tool timeout for the first `save`, which downloads about 90MB of
+embedding-model weights. Edit `~/.codex/config.toml` (or a trusted project's
+`.codex/config.toml`):
+
+```toml
+[mcp_servers.husmo]
+command = "husmo"
+tool_timeout_sec = 120
+```
+
+Add the skill. Codex reads user skills from `~/.agents/skills/`:
+
+```sh
+mkdir -p ~/.agents/skills/husmo-document-management
+curl -sSL https://raw.githubusercontent.com/frantufro/husmo/main/claude-plugin/skills/husmo-document-management/SKILL.md \
+  -o ~/.agents/skills/husmo-document-management/SKILL.md
+```
+
+Restart Codex and check `codex mcp list`.
+
+</details>
+
+<details>
+<summary><b>Kilo Code</b></summary>
+
+Add husmo under the `mcp` key of `~/.config/kilo/kilo.json` (or `kilo.json` /
+`.kilo/kilo.json` in a project). Keep any entries already in the file:
+
+```json
+{
+  "mcp": {
+    "husmo": {
+      "type": "local",
+      "command": ["husmo"],
+      "enabled": true
+    }
+  }
+}
+```
+
+In the VS Code extension you can also open Settings → MCP → Add Server and
+choose Local (stdio) with the command `husmo`.
+
+Add the skill. Kilo loads skills from `~/.agents/skills/` by default:
+
+```sh
+mkdir -p ~/.agents/skills/husmo-document-management
+curl -sSL https://raw.githubusercontent.com/frantufro/husmo/main/claude-plugin/skills/husmo-document-management/SKILL.md \
+  -o ~/.agents/skills/husmo-document-management/SKILL.md
+```
+
+Restart Kilo and check `kilo mcp list`.
+
+</details>
+
+<details>
+<summary><b>Pi</b></summary>
+
+Pi has MCP support built in. Register the server:
+
+```sh
+pi mcp add husmo -- husmo
+```
+
+Add `--local` to register it for the current project only (the project file
+is `.pi/mcp.json`, read once you trust the project). The user-level file is
+`~/.pi/agent/mcp.json`, and the entry looks like:
+
+```json
+{ "mcpServers": { "husmo": { "command": "husmo" } } }
+```
+
+Add the skill. Pi reads skills from `~/.agents/skills/` as well as
+`~/.pi/agent/skills/`:
+
+```sh
+mkdir -p ~/.agents/skills/husmo-document-management
+curl -sSL https://raw.githubusercontent.com/frantufro/husmo/main/claude-plugin/skills/husmo-document-management/SKILL.md \
+  -o ~/.agents/skills/husmo-document-management/SKILL.md
+```
+
+Run `/reload` in Pi (or restart it) and check `pi mcp list`.
+
+</details>
+
+#### Check that it works
+
+Ask your agent to save a page:
+
+> save https://example.com/some-article and tell me what links it points at
+
+The first `save` or `search-semantic` call downloads the local embedding
+model's weights (see "Local-first" below) and caches them. Every call after
+that works without network access for embeddings.
+
+#### Troubleshooting
+
+**husmo's tools never appear.** Agents read their MCP config at startup, so
+restart the agent, then list its MCP servers with the command in your agent's
+block above. A missing `husmo` row means the registration landed in a config
+file the agent is not reading.
+
+**The server connects and every tool call fails.** The data repo is missing.
+Run `husmo init --repo <url>` (step 2), then restart the agent.
+
+**The server fails with a spawn error.** The registration names a binary that
+has moved or is missing from the agent's `PATH`. Use the absolute path from
+`which husmo` as the command.
+
+**The first save is slow or times out.** It is fetching about 90MB of
+model weights in that one call. Raise the timeout as shown in your agent's
+block and try again.
+
+**`husmo init` fails with an SSH authentication error.** The message names the
+key files tried. Load a passphrase-protected key into an ssh-agent, or use a
+passphrase-less key in `~/.ssh`.
 
 ## Local-first: no external services
 
@@ -58,230 +281,18 @@ Concretely:
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and
 [`CONTEXT.md`](CONTEXT.md) for the domain glossary.
 
-## Install
+## What `husmo init` does
 
-```bash
-curl -sSL https://raw.githubusercontent.com/frantufro/husmo/main/install.sh | sh
-```
+1. Clones the given git URL into the current directory. It refuses to run if
+   that directory already exists and is not empty, so nothing already there
+   gets overwritten.
+2. Writes the config file (see "Configuration" below) with `data_repo_path`
+   set to the clone, so the MCP server has a data repo the moment `init`
+   finishes.
 
-Or via Homebrew (macOS and Linux):
-
-```bash
-brew install frantufro/tap/husmo
-```
-
-Or build and install from source:
-
-```bash
-git clone https://github.com/frantufro/husmo.git
-cd husmo
-cargo install --path .
-```
-
-## Setup
-
-husmo needs a data repo (see "Repo split" above) before its MCP server has
-anywhere to save Documents. `husmo init` bootstraps one:
-
-```sh
-cd wherever/you/want/the/data/repo
-husmo init --repo git@github.com:you/husmo-data.git
-```
-
-`--repo` is optional; omitted, `husmo init` prompts for the URL
-interactively instead, for a scripted/non-interactive setup. `init`:
-
-1. Clones the given git URL into the current directory. Refuses to run if
-   that directory already exists and isn't empty, so it never clobbers
-   anything already there.
-2. Writes/updates the config file below to point `data_repo_path` at the
-   clone, so the MCP server has a working data repo location the moment
-   `init` finishes — no separate manual config-editing step.
-
-An empty git repo works too (`git init --bare` it somewhere first, or create
-one on your git host and skip pushing anything to it before cloning);
-`init` doesn't require the repo to already contain Documents.
-
-Once a data repo is configured, point an MCP client at the `husmo` binary run
-with no arguments. `husmo init` bootstraps the data repo; bare `husmo` is the
-MCP server. It speaks the standard MCP stdio transport, so any client that
-handles stdio servers can reach it. See "Use husmo from OpenCode" and "Use
-husmo from Claude Code" below for the two hosts husmo packages itself for.
-
-The first `save` or `search-semantic` call downloads the local embedding
-model's weights (see "Local-first" above) and caches them. Every call after
-that, including in future runs, works without network access for embeddings.
-
-## Use husmo from OpenCode
-
-```sh
-npx @frantufro/husmo install
-```
-
-That installs the three pieces OpenCode needs and reports on a fourth:
-
-```
-  ✓ skill   installed  ~/.config/opencode/skills/husmo-document-management
-  ✓ binary  downloaded husmo 0.1.4 to ~/.local/bin/husmo
-  ✓ mcp     registered husmo in  ~/.config/opencode/opencode.json
-  → data    no config at ~/.config/husmo/config.toml
-    create a data repo before using husmo's tools:
-      cd wherever/you/want/the/data/repo
-      husmo init --repo git@github.com:you/husmo-data.git
-
-  restart OpenCode to pick up the skill and the husmo tools.
-```
-
-| Piece | Where it lands | What it does |
-| --- | --- | --- |
-| Skill | `~/.config/opencode/skills/husmo-document-management/` | teaches the agent when to save a page and how to triage the outgoing links `save` reports |
-| MCP registration | the `mcp` block of `~/.config/opencode/opencode.json` | makes OpenCode spawn the binary, which is what puts husmo's tools in front of the model |
-| Binary | `~/.local/bin/husmo`, from the latest GitHub release | skipped when `husmo` is already on `PATH` (Homebrew, cargo, `install.sh`) |
-| Data repo | wherever you choose | created by `husmo init`; the installer reports whether one is configured and stops there |
-
-The skill and the registration are separate pieces. The skill is instructions
-for the model; the registration is what makes OpenCode start the server at all.
-The installer places both, which is why one command covers the setup.
-
-Re-running the installer is safe. Anything already in place and unchanged is
-reported as `up to date` and left alone, so it doubles as a way to repair a
-half-finished setup.
-
-### Verify
-
-Restart OpenCode, then:
-
-```sh
-opencode mcp list
-```
-
-```
-┌  MCP Servers
-│
-●  ✓ husmo connected
-│      /opt/homebrew/bin/husmo
-│
-└  1 server(s)
-```
-
-To exercise the whole path — skill, server, and data repo — ask the agent to
-save a page:
-
-> save https://example.com/some-article and tell me what links it points at
-
-### Install into one project
-
-```sh
-npx @frantufro/husmo install --project
-```
-
-This writes `./.opencode/skills/husmo-document-management/` and a `husmo` entry
-in `./opencode.json`, both of which OpenCode picks up for that directory only.
-Both are safe to commit: the project registration runs `husmo` through `PATH`,
-so it stays correct for every teammate who has husmo installed.
-
-### Options
-
-| Flag | Effect |
-| --- | --- |
-| `--project` | install into the current project; the default is the user config directory |
-| `--force` | overwrite an existing skill or registration without asking |
-| `--skip-existing` | keep whatever is already there and exit 0 |
-| `--no-binary` | install the skill and registration only |
-| `--dry-run` | report every action, write nothing |
-
-On a terminal, a skill or registration that differs from what the installer
-would write prompts you before anything is overwritten. In a script or CI,
-where there is nobody to ask, the same situation fails with exit 1 and leaves
-the file untouched; pass `--force` or `--skip-existing` to say which you meant.
-
-### What the registration looks like
-
-```jsonc
-{
-  "mcp": {
-    "husmo": {
-      "type": "local",
-      "command": ["/Users/you/.local/bin/husmo"],
-      "timeout": 120000
-    }
-  }
-}
-```
-
-The installer edits `opencode.json` in place through the same JSONC library
-OpenCode itself uses, so comments, formatting, and the provider credentials
-that usually live in that file all survive untouched. An existing
-`opencode.jsonc` is used when there is one.
-
-`timeout` is raised from OpenCode's default of 30 seconds because the first
-`save` or `search-semantic` downloads roughly 90MB of embedding-model weights
-inside a single tool call. Later calls use the cache and return quickly.
-
-### Setting it up by hand
-
-The installer performs three ordinary steps, each doable by hand:
-
-1. Install the binary (see "Install" above) and run `husmo init`.
-2. Copy [`claude-plugin/skills/husmo-document-management/`](claude-plugin/skills/husmo-document-management)
-   into `~/.config/opencode/skills/`.
-3. Add the `mcp` block shown above to `~/.config/opencode/opencode.json`,
-   with `command` pointing at your `husmo`.
-
-OpenCode 1.18 and later can write step 3 for you:
-
-```sh
-opencode mcp add husmo -- husmo
-```
-
-That form always targets the global config and sets no timeout, so adjust the
-file afterwards if you want either changed.
-
-### Troubleshooting
-
-**husmo's tools never appear.** OpenCode reads its config at startup, so
-restart it. Then run `opencode mcp list`: a missing `husmo` row means the
-registration landed in a config file OpenCode isn't reading — check
-`opencode debug paths` against the path the installer printed.
-
-**`husmo connected` but every tool call fails.** The server is running and the
-data repo is missing. Run `husmo init --repo <url>` in the directory you want
-the Documents to live in, then restart OpenCode.
-
-**The server shows as failed with a spawn error.** The registration names a
-binary that has moved. Re-run `npx @frantufro/husmo install --force` to point
-it at the current one.
-
-**The first save takes a long time or times out.** It is fetching roughly
-90MB of embedding-model weights inside that one call. Raise `timeout` in the
-registration and try again; once the weights are cached, every later call
-returns quickly.
-
-**`~/.local/bin` is not on your PATH.** The installer says so when it downloads
-there. Add `export PATH="$HOME/.local/bin:$PATH"` to your shell config; the
-global registration uses the absolute path, so OpenCode works either way.
-
-## Use husmo from Claude Code
-
-Install the binary and run `husmo init` first (see "Install" and "Setup"
-above), then add the plugin:
-
-```
-/plugin marketplace add frantufro/claude-plugins
-/plugin install husmo@frantufro-plugins
-```
-
-The plugin carries `claude-plugin/` from this repository: the same skill the
-OpenCode installer copies, plus an MCP server declaration that runs `husmo`
-through `PATH`. Restart Claude Code and husmo's tools are available.
-
-Claude Code sets MCP timeouts through environment variables. If the first
-`save` times out while the embedding weights download, raise them and restart:
-
-```sh
-export MCP_TIMEOUT=120000
-export MCP_TOOL_TIMEOUT=120000
-```
+An empty git repo works. Create one on your git host and clone it before
+pushing anything to it. `--repo` is optional: without it, `husmo init` asks for
+the URL interactively.
 
 ## Configuration
 
@@ -291,7 +302,7 @@ husmo reads a TOML config file that points at the data repo:
 data_repo_path = "/path/to/your/husmo-data"
 ```
 
-`husmo init` writes this file for you (see "Setup" above); editing it by
+`husmo init` writes this file for you (see "What `husmo init` does" above); editing it by
 hand is only needed to point at a different data repo later. husmo locates
 the file by checking, in order:
 
